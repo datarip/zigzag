@@ -31,7 +31,7 @@ enum SidebarMenus {
         // The outline face: macOS draws face.smiling filled in dark mode.
         static let changeIcon = "face.dashed", folder = "folder", showTab = "arrow.forward.square"
         static let close = "xmark", closeSplit = "xmark.rectangle", closeBelow = "arrow.down.to.line", closeOthers = "xmark.circle"
-        static let remove = "trash"
+        static let remove = "trash", sort = "arrow.up.arrow.down"
     }
 
     /// The spaces to move something to, as a submenu's items: under their profiles' names once there's more than
@@ -596,6 +596,12 @@ enum SidebarMenus {
         if isCurrent {
             menu.addItem(Item(String(localized: "New Folder", comment: "Item in a space's context menu."), symbol: Symbol.newFolder) { controller.newFolder() })
             menu.addItem(Item(LiveFolderSheet.newTitle, symbol: LiveFolderSheet.symbol) { controller.newLiveFolder() })
+        }
+        // A space with one pinned page and no folder has nothing to sort. Any space's menu can sort that space's pins.
+        if !Library.shared.folders(in: id).isEmpty || Library.shared.bookmarks(in: id).count > 1 {
+            menu.addItem(Item(String(localized: "Sort Alphabetically", comment: "Item in a space's context menu in the sidebar: sorts the space's pinned tabs and folders by name, at every level."), symbol: Symbol.sort) {
+                controller.sortPinnedTabs(in: id)
+            })
         }
         // Every pinned folder at once, each only when it would change something (#343).
         if BrowserWindowController.hasFolders(in: id, isOpen: true) {

@@ -154642,6 +154642,17 @@
         }
       }
     },
+    "Sort Alphabetically" : {
+      "comment" : "Item in a space's context menu in the sidebar: sorts the space's pinned tabs and folders by name, at every level.\nUndo action name, shown in the Edit menu as Undo Sort Alphabetically.",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按字母顺序排列"
+          }
+        }
+      }
+    },
     "Sort by Name" : {
       "comment" : "A choice for the order of the list in Settings › Privacy › Stored by Websites.",
       "localizations" : {

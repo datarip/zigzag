@@ -1730,6 +1730,114 @@ final class Library {
         return at - start <= end - at ? start : end
     }
 
+    // MARK: Sorting
+
+    /// Sorts a space's pinned folders and pages by name, at every level, in one change. Its tabs, favorites and the
+    /// other spaces are left as they are.
+    func sortPinnedTabs(in spaceID: UUID) {
+        guard let s = index(of: spaceID) else { return }
+        let tidy = Self.sortedPinned(bookmarks: spaces[s].bookmarks, folders: spaces[s].folders ?? [],
+                                     splits: spaces[s].pinnedSplits ?? [])
+        guard tidy.bookmarks != spaces[s].bookmarks || tidy.folders != (spaces[s].folders ?? [])
+                || tidy.splits != (spaces[s].pinnedSplits ?? []) else { return }
+        spaces[s].bookmarks = tidy.bookmarks
+        if spaces[s].folders != nil { spaces[s].folders = tidy.folders }
+        spaces[s].pinnedSplits = tidy.splits.isEmpty ? nil : tidy.splits
+        commit()
+    }
+
+    /// A workspace's pinned folders and pages in name order: at every level its folders by name, then the pages by
+    /// title, with each pinned split kept in one piece. Folders take a rank before their parent's pages, so the list
+    /// draws this order and the next drop starts from it. `tidied` runs last, so a split's pages stay together and in
+    /// one folder.
+    nonisolated static func sortedPinned(bookmarks: [Bookmark], folders: [BookmarkFolder], splits: [PinnedSplit])
+        -> (bookmarks: [Bookmark], folders: [BookmarkFolder], splits: [PinnedSplit]) {
+        let byID = Dictionary(bookmarks.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let known = Set(folders.map(\.id))
+        // A folder with no parent here sits at the top level, as `tidied` reads it.
+        func parent(of folder: BookmarkFolder) -> UUID? {
+            guard let parent = folder.parentID, known.contains(parent) else { return nil }
+            return parent
+        }
+        // The folder that lists a page: the first that does, as `tidied` keeps a page in one folder at most.
+        var listedIn: [UUID: UUID] = [:]
+        for folder in folders {
+            for id in folder.bookmarkIDs where byID[id] != nil && listedIn[id] == nil { listedIn[id] = folder.id }
+        }
+        // Each split is one page unit, led by its first page, its other pages right behind it.
+        var riders: [UUID: [UUID]] = [:]
+        var riderOf: [UUID: UUID] = [:]
+        var inSplit: Set<UUID> = []
+        for split in splits {
+            let ids = split.ids.filter { byID[$0] != nil }
+            guard ids.count > 1, ids.first == split.left, Set(ids).count == ids.count, inSplit.isDisjoint(with: ids) else { continue }
+            riders[split.left] = Array(ids.dropFirst())
+            for id in ids.dropFirst() { riderOf[id] = split.left }
+            inSplit.formUnion(ids)
+        }
+        struct Unit {
+            let ids: [UUID]
+            let at: Int
+            let title: String
+        }
+        var units: [UUID?: [Unit]] = [:]
+        for (at, page) in bookmarks.enumerated() where riderOf[page.id] == nil {
+            units[listedIn[page.id], default: []].append(Unit(ids: [page.id] + (riders[page.id] ?? []), at: at, title: page.title))
+        }
+        var children: [UUID?: [(folder: BookmarkFolder, at: Int)]] = [:]
+        for (at, folder) in folders.enumerated() { children[parent(of: folder), default: []].append((folder, at)) }
+        // A stable sort: two names that compare equal keep the order they had.
+        func inOrder<T>(_ list: [T], name: (T) -> String, at: (T) -> Int) -> [T] {
+            list.sorted { a, b in
+                let order = name(a).localizedStandardCompare(name(b))
+                return order == .orderedSame ? at(a) < at(b) : order == .orderedAscending
+            }
+        }
+        // Each parent's children and page units in order, sorted once and used by the places, the tree and the folders.
+        var sortedChildren: [UUID?: [BookmarkFolder]] = [:]
+        for parent in children.keys {
+            sortedChildren[parent] = inOrder(children[parent] ?? [], name: { $0.folder.name }, at: { $0.at }).map(\.folder)
+        }
+        var sortedUnits: [UUID?: [Unit]] = [:]
+        for parent in units.keys {
+            sortedUnits[parent] = inOrder(units[parent] ?? [], name: { $0.title }, at: { $0.at })
+        }
+        // Every folder takes a place before its parent's pages: negative, so a page put in at 0 or more never moves it.
+        var result = folders
+        let folderIndex = Dictionary(result.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+        for (parent, sorted) in sortedChildren {
+            for (index, folder) in sorted.enumerated() {
+                if let at = folderIndex[folder.id] { result[at].rank = -(Double(sorted.count) - Double(index)) - 0.5 }
+            }
+        }
+        // The pages in the order the list draws them: each folder's subtree, then its own sorted pages.
+        var order: [UUID] = []
+        var placed: Set<UUID> = []
+        enum Work { case parent(UUID?), unit(Unit) }
+        var work: [Work] = [.parent(nil)]
+        while let next = work.popLast() {
+            switch next {
+            case .parent(let parent):
+                var items: [Work] = []
+                for folder in sortedChildren[parent] ?? [] { items.append(.parent(folder.id)) }
+                for unit in sortedUnits[parent] ?? [] { items.append(.unit(unit)) }
+                work.append(contentsOf: items.reversed())
+            case .unit(let unit):
+                for id in unit.ids where placed.insert(id).inserted { order.append(id) }
+            }
+        }
+        // A damaged record's pages still stay pinned, at the end, in their old order.
+        for page in bookmarks where placed.insert(page.id).inserted { order.append(page.id) }
+        // Each folder holds its direct pages in the sorted order, a split's other pages after its first.
+        var direct: [UUID: [UUID]] = [:]
+        for parent in sortedUnits.keys {
+            guard let parent else { continue }
+            for unit in sortedUnits[parent] ?? [] { direct[parent, default: []].append(contentsOf: unit.ids) }
+        }
+        for index in result.indices { result[index].bookmarkIDs = direct[result[index].id] ?? [] }
+        return tidied(order.compactMap { byID[$0] }, result, splits)
+    }
+
     /// Puts a pinned page in a folder of its space (at the end of it), or takes it out of any folder (nil).
     func setFolder(of bookmarkID: UUID, to folderID: UUID?) {
         // A pinned split goes in as one: its first page leads, and the rest follow it there.
@@ -1793,6 +1901,22 @@ final class Library {
             guard Set(pages).count == pages.count, pages.allSatisfy(ids.contains), paired.isDisjoint(with: pages) else { return false }
             paired.formUnion(pages)
             return true
+        }
+        // A split already in one row and one folder has nothing to move: the sort's own tree is always like this, and
+        // checking it keeps a workspace of thousands from walking every page and folder again.
+        let position = Dictionary(bookmarks.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var firstFolder: [UUID: UUID] = [:]
+        for folder in folders { for id in folder.bookmarkIDs where firstFolder[id] == nil { firstFolder[id] = folder.id } }
+        let settled = kept.allSatisfy { split in
+            let pages = split.ids
+            guard let start = position[pages[0]] else { return false }
+            for (offset, id) in pages.enumerated() where position[id] != start + offset { return false }
+            let home = firstFolder[pages[0]]
+            return pages.dropFirst().allSatisfy { firstFolder[$0] == home }
+        }
+        if settled {
+            let (list, folders) = tidied(bookmarks, folders)
+            return (list, folders, kept)
         }
         var list = bookmarks
         var folders = folders
@@ -2132,56 +2256,87 @@ final class Library {
     nonisolated static func tidied(_ bookmarks: [Bookmark], _ folders: [BookmarkFolder]) -> ([Bookmark], [BookmarkFolder]) {
         var folders = folders
         let ids = bookmarks.map(\.id)
-        // Only pages that still exist, in the space's order, and each in one folder at most (the first that has it).
-        var claimed: Set<UUID> = []
-        for f in folders.indices {
-            folders[f].bookmarkIDs = ids.filter { folders[f].bookmarkIDs.contains($0) && !claimed.contains($0) }
-            claimed.formUnion(folders[f].bookmarkIDs)
+        let present = Set(ids)
+        // Only pages that still exist, and each in one folder at most (the first that has it), as it always has been.
+        var owner: [UUID: UUID] = [:]
+        for folder in folders {
+            for id in folder.bookmarkIDs where present.contains(id) && owner[id] == nil { owner[id] = folder.id }
         }
+        // Each folder's pages in the list's order. Pages in no folder are the top level's own.
+        var direct: [UUID?: [UUID]] = [:]
+        for id in ids {
+            if let folder = owner[id] { direct[folder, default: []].append(id) } else { direct[nil, default: []].append(id) }
+        }
+        for f in folders.indices { folders[f].bookmarkIDs = direct[folders[f].id] ?? [] }
         // A folder's parent is a folder that's here, and never itself or one inside it.
-        let known = Set(folders.map(\.id))
+        let indexByID = Dictionary(folders.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
         for f in folders.indices {
             guard let parent = folders[f].parentID else { continue }
             var seen: Set<UUID> = [folders[f].id], p: UUID? = parent, loops = false
             while let q = p {
-                if !known.contains(q) || !seen.insert(q).inserted { loops = true; break }
-                p = folders.first { $0.id == q }?.parentID
+                guard let at = indexByID[q], seen.insert(q).inserted else { loops = true; break }
+                p = folders[at].parentID
             }
             if loops { folders[f].parentID = nil }
         }
         // Each level in the order its first page comes; an empty folder at the top of where it sits. Pages of a folder
         // and of all its subfolders end up side by side, each subfolder's inside its parent's.
+        var children: [UUID?: [Int]] = [:]
+        for (i, folder) in folders.enumerated() { children[folder.parentID, default: []].append(i) }
         let position = Dictionary(ids.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
-        var folderOf: [UUID: UUID] = [:]
-        for folder in folders { for id in folder.bookmarkIDs { folderOf[id] = folder.id } }
         var firstAt: [UUID: Int] = [:]
-        func first(_ id: UUID) -> Int {
-            if let known = firstAt[id] { return known }
-            firstAt[id] = -1
-            let own = folders.first { $0.id == id }?.bookmarkIDs.compactMap { position[$0] } ?? []
-            let inner = folders.children(of: id).map { first($0.id) }.filter { $0 >= 0 }
-            let at = (own + inner).min() ?? -1
+        var stack: [(index: Int, entered: Bool)] = (children[nil] ?? []).map { ($0, false) }
+        while let (index, entered) = stack.popLast() {
+            let id = folders[index].id
+            guard entered else {
+                stack.append((index, true))
+                for child in children[id] ?? [] { stack.append((child, false)) }
+                continue
+            }
+            var at = direct[id]?.first.flatMap { position[$0] } ?? -1
+            for child in children[id] ?? [] {
+                let inner = firstAt[folders[child].id] ?? -1
+                if inner >= 0, at < 0 || inner < at { at = inner }
+            }
             firstAt[id] = at
-            return at
+        }
+        for parent in Array(children.keys) {
+            children[parent]?.sort {
+                let a = firstAt[folders[$0].id] ?? -1
+                let b = firstAt[folders[$1].id] ?? -1
+                return a == b ? $0 < $1 : a < b
+            }
         }
         let byID = Dictionary(bookmarks.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         var result: [Bookmark] = []
         var placed: Set<UUID> = []
-        var emitted: Set<UUID> = []
-        func emit(_ parent: UUID?) {
-            var units: [(at: Int, order: Int, page: UUID?, folder: UUID?)] = []
-            for (i, id) in ids.enumerated() where folderOf[id] == parent { units.append((i, i, id, nil)) }
-            for (i, folder) in folders.enumerated() where folder.parentID == parent { units.append((first(folder.id), ids.count + i, nil, folder.id)) }
-            units.sort { ($0.at, $0.order) < ($1.at, $1.order) }
-            for unit in units {
-                if let page = unit.page, !placed.contains(page), let b = byID[page] { result.append(b); placed.insert(page) }
-                if let folder = unit.folder, emitted.insert(folder).inserted { emit(folder) }
+        enum Work { case parent(UUID?), page(UUID) }
+        var work: [Work] = [.parent(nil)]
+        while let next = work.popLast() {
+            switch next {
+            case .page(let id):
+                if placed.insert(id).inserted, let bookmark = byID[id] { result.append(bookmark) }
+            case .parent(let parent):
+                let pages = direct[parent] ?? []
+                let childIndexes = children[parent] ?? []
+                var items: [Work] = []
+                var pageAt = 0, childAt = 0
+                while pageAt < pages.count || childAt < childIndexes.count {
+                    let pageKey = pageAt < pages.count ? (position[pages[pageAt]] ?? Int.max) : Int.max
+                    let childKey = childAt < childIndexes.count ? (firstAt[folders[childIndexes[childAt]].id] ?? Int.max) : Int.max
+                    if childKey < pageKey {
+                        items.append(.parent(folders[childIndexes[childAt]].id))
+                        childAt += 1
+                    } else {
+                        items.append(.page(pages[pageAt]))
+                        pageAt += 1
+                    }
+                }
+                work.append(contentsOf: items.reversed())
             }
         }
-        emit(nil)
         // Anything a broken record left out still stays pinned, at the end.
-        for bookmark in bookmarks where !placed.contains(bookmark.id) { result.append(bookmark) }
-        for f in folders.indices { folders[f].bookmarkIDs = result.map(\.id).filter { folders[f].bookmarkIDs.contains($0) } }
+        for bookmark in bookmarks where placed.insert(bookmark.id).inserted { result.append(bookmark) }
         return (result, folders)
     }
 

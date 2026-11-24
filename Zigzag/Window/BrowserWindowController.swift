@@ -3905,6 +3905,17 @@ extension BrowserWindowController: SidebarDelegate {
         tabManager.forgetClosedPins(ids)
         for controller in WindowManager.shared.controllers where controller !== self { controller.tabManager.forgetClosedPins(ids) }
     }
+    /// Sorts a space's pinned folders and pages by name, at every level: one change, one undo step. A private window
+    /// keeps its pins as they are.
+    func sortPinnedTabs(in spaceID: UUID) {
+        guard !tabManager.isPrivate else { return }
+        let name = String(localized: "Sort Alphabetically", comment: "Undo action name, shown in the Edit menu as Undo Sort Alphabetically.")
+        let before = Library.shared.snapshot
+        Library.shared.sortPinnedTabs(in: spaceID)
+        // Already in order: nothing moved, so no undo step that would do nothing.
+        guard Library.shared.snapshot != before else { return }
+        recordLibraryUndo(name, before: before)
+    }
     /// Whether any of the space's pinned folders is open (or shut, for `open` false).
     static func hasFolders(in spaceID: UUID, isOpen open: Bool) -> Bool {
         Library.shared.folders(in: spaceID).contains { $0.isOpen == open }

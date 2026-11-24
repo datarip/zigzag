@@ -121,6 +121,7 @@
 		3040C2048D4ACF4660297AD4 /* EdgeSidebarTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 194F969DEA62E48AE6BA906D /* EdgeSidebarTests.swift */; };
 		3048A1B301D8F87A94840074 /* MCPHTTP.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81C684CBB391686C907F7D7C /* MCPHTTP.swift */; };
 		305C1B0D98D51109FD096CEE /* InPageMiniPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B209C1163087A8AF33C953D /* InPageMiniPolicyTests.swift */; };
+		311D77E1F7D27D60A446E82B /* PinnedSortTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1DCCFD775BAD2E75926FE7B /* PinnedSortTests.swift */; };
 		312E767FFE2DA701B16F3D6C /* SyncSettingsRows.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37B362C24295B05CCC24AC1A /* SyncSettingsRows.swift */; };
 		318A469BA7739143180BF844 /* DarkSeen.swift in Sources */ = {isa = PBXBuildFile; fileRef = A69950C3F8014CFB7FAB861A /* DarkSeen.swift */; };
 		339255F1AB371362E5339EA4 /* MCPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 928D7647F31AE3EE93056E2F /* MCPServer.swift */; };
@@ -1158,6 +1159,7 @@
 		B13E82E7DA1A290559EC8C20 /* SplitDropTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplitDropTests.swift; sourceTree = "<group>"; };
 		B156858DA58593FF8CECD513 /* SessionCookies.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionCookies.swift; sourceTree = "<group>"; };
 		B1C94BBE34DB020CBB3EA2A2 /* ProxyRulesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyRulesTests.swift; sourceTree = "<group>"; };
+		B1DCCFD775BAD2E75926FE7B /* PinnedSortTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinnedSortTests.swift; sourceTree = "<group>"; };
 		B236FBFCF8198AC862EEC0D2 /* PromptHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PromptHost.swift; sourceTree = "<group>"; };
 		B2C87EDAE3511F77A3075B9B /* FirefoxManifestTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirefoxManifestTests.swift; sourceTree = "<group>"; };
 		B3AD1C19026E47583E6DC0CD /* ZigzagWebApp */ = {isa = PBXFileReference; includeInIndex = 0; path = ZigzagWebApp; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -2182,6 +2184,7 @@
 				D60DD3C9423AB6F82F6BF9E3 /* PictureInPictureFloatTests.swift */,
 				B74F02EFF5D8CE83982112ED /* PinnedDropTests.swift */,
 				237C05967268C4FE34C059FC /* PinnedGroupTests.swift */,
+				B1DCCFD775BAD2E75926FE7B /* PinnedSortTests.swift */,
 				394832E31B84782D179A328D /* PinnedSpaceNameResizeTests.swift */,
 				8FB2C82F9690C9AFD44179D6 /* ProfileDirectoryTests.swift */,
 				400EEF52096D1DE0A08306FF /* ProxyCheckTests.swift */,
@@ -3162,6 +3165,7 @@
 				E47EF535CB300C32A77F00F2 /* PictureInPictureFloatTests.swift in Sources */,
 				B3EB794CF43760A20C3CED73 /* PinnedDropTests.swift in Sources */,
 				DD67188EC0D095B23AE822F5 /* PinnedGroupTests.swift in Sources */,
+				311D77E1F7D27D60A446E82B /* PinnedSortTests.swift in Sources */,
 				EB9F2029F6F6FD67B9F34E11 /* PinnedSpaceNameResizeTests.swift in Sources */,
 				FA39475A30BCCFE05D55F4E3 /* ProfileDirectoryTests.swift in Sources */,
 				10ED316D4DDDE144EAA77A5D /* ProxyCheckTests.swift in Sources */,
