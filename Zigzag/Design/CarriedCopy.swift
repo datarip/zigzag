@@ -27,16 +27,26 @@ final class CarriedCopy {
     /// A copy of `view`, held where the pointer pressed it (a point on screen). `ground`: drawn under the picture, for
     /// rows that are see-through on the sidebar. `alternate`: the second shape, the pointer holding it at `grab`.
     convenience init(of view: NSView, picture image: NSImage?, grabbedAt screenPoint: NSPoint, ground: NSColor?, radius: CGFloat,
+                     stack: Stack? = nil,
                      alternate: (view: NSView, size: NSSize, grab: NSPoint, radius: CGFloat)? = nil) {
         let rect = view.window?.convertToScreen(view.convert(view.bounds, to: nil)) ?? .zero
         self.init(picture: image, size: rect.size, grab: NSPoint(x: screenPoint.x - rect.minX, y: screenPoint.y - rect.minY),
-                  at: screenPoint, appearance: view.effectiveAppearance, ground: ground, radius: radius, alternate: alternate)
+                  at: screenPoint, appearance: view.effectiveAppearance, ground: ground, radius: radius, stack: stack,
+                  alternate: alternate)
+    }
+
+    /// What a picked set looks like while carried: how many rows, and how many of them are folders and tabs.
+    struct Stack {
+        let total: Int
+        let folders: Int
+        let tabs: Int
     }
 
     /// A copy of something not shown at this size (a pane's page, small): `image` at `size`, the pointer holding it at
     /// `grab` (from its bottom-left corner), now at `screenPoint`.
     init(picture image: NSImage?, size: NSSize, grab: NSPoint, at screenPoint: NSPoint, appearance: NSAppearance, ground: NSColor?,
-         radius: CGFloat, alternate: (view: NSView, size: NSSize, grab: NSPoint, radius: CGFloat)? = nil) {
+         radius: CGFloat, stack: Stack? = nil,
+         alternate: (view: NSView, size: NSSize, grab: NSPoint, radius: CGFloat)? = nil) {
         self.size = size
         self.grab = grab
         self.alternate = alternate?.view
@@ -81,8 +91,45 @@ final class CarriedCopy {
         card.frame = frame(alternate: false)
         picture.frame = card.bounds
         alternate?.view.frame = card.bounds
+        if let stack, stack.total > 1 { showStack(stack, in: content, fill: fill) }
         updateShadow()
         follow(screenPoint)
+    }
+
+    /// Draws the rest of a picked set behind the top card: up to two more cards, and a small count. Over five rows
+    /// the count says how many folders and tabs are in the set.
+    private func showStack(_ stack: Stack, in content: NSView, fill: CGColor?) {
+        for step in (1...min(2, stack.total - 1)).reversed() {
+            let back = NSView(frame: card.frame.insetBy(dx: CGFloat(step) * 3, dy: 0)
+                .offsetBy(dx: -CGFloat(step) * 4, dy: CGFloat(step) * 4))
+            back.wantsLayer = true
+            back.layer?.cornerRadius = radius
+            back.layer?.cornerCurve = .continuous
+            back.layer?.backgroundColor = fill?.copy(alpha: 0.65) ?? NSColor.windowBackgroundColor.withAlphaComponent(0.65).cgColor
+            back.layer?.borderWidth = 1
+            back.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+            content.addSubview(back, positioned: .below, relativeTo: card)
+        }
+        let text: String
+        if stack.total > 5 {
+            var parts: [String] = []
+            if stack.folders > 0 { parts.append("\(stack.folders) folders") }
+            if stack.tabs > 0 { parts.append("\(stack.tabs) tabs") }
+            text = parts.isEmpty ? "\(stack.total)" : "+ " + parts.joined(separator: " and ")
+        } else {
+            text = "\(stack.total)"
+        }
+        let badge = NSTextField(labelWithString: text)
+        badge.font = .systemFont(ofSize: 11, weight: .semibold)
+        badge.textColor = .white
+        badge.alignment = .center
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
+        badge.layer?.cornerRadius = 7
+        badge.sizeToFit()
+        let width = max(20, badge.frame.width + 12)
+        badge.frame = NSRect(x: card.frame.maxX - width - 6, y: card.frame.minY + 5, width: width, height: 16)
+        content.addSubview(badge, positioned: .above, relativeTo: card)
     }
 
     /// A newer picture of the same thing, clipped to the copy's corners (a page's, taken once the drag began).

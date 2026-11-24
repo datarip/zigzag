@@ -74,10 +74,12 @@ class SidebarRowView: InteractiveView {
         let base: NSColor?
         // While the list slides the card here from the row it was on, this row leaves its own card to it.
         let showsCard = (isSelected && !holdsCardBack) || isLifted
-        if showsCard {
-            base = isHovered ? Tokens.Chrome.cardHover : Tokens.Chrome.card
-        } else if isMarked {
+        // A picked row shows its mark over the card of the page you're on: the mark says what the next action will
+        // take, and the card's edge and shadow still say which page is showing.
+        if isMarked {
             base = Brand.Theme.for(self).accent.withAlphaComponent(isHovered ? 0.26 : 0.2)
+        } else if showsCard {
+            base = isHovered ? Tokens.Chrome.cardHover : Tokens.Chrome.card
         } else if isSelected {
             // Waiting for the sliding card: no wash of its own under the pointer, so one card arrives, not a second box.
             base = nil

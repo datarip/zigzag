@@ -4,6 +4,15 @@ import UniformTypeIdentifiers
 import WebKit
 
 /// One browser window: its tabs, its sidebar, its page card, and everything floating above them.
+/// One cross-window pinned move, undone once from either window that took part: the library is shared, so the first
+/// ⌘Z restores it and the other window's entry then does nothing.
+private final class CrossWindowPinnedUndo {
+    let before: Library.Snapshot
+    var used = false
+
+    init(before: Library.Snapshot) { self.before = before }
+}
+
 final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     /// Where tabs moved out of this window go back to on ⌘Z (#167): this window, or once it has closed, the window ⌘Z
     /// opened in its place.
@@ -612,48 +621,252 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     /// instead), it lands among the pinned tabs or the tabs right where it was dropped, and this window comes forward.
     func takePinned(_ bookmarkID: UUID, from source: BrowserWindowController, to drop: SidebarDrop? = nil,
                     at screenPoint: NSPoint) -> NSView? {
+        guard !tabManager.isPrivate, !source.tabManager.isPrivate else { return nil }
         let ids = Library.shared.pinnedSplit(containing: bookmarkID).map(\.ids) ?? [bookmarkID]
-        // Sharing windows have the same pages (#162): nothing to bring over.
-        for id in ids where source.tabManager.store !== tabManager.store {
-            if tabManager.bookmarkTab(for: id) != nil {
-                if let live = source.tabManager.bookmarkTab(for: id) { source.tabManager.close(live) }
-            } else if let live = source.tabManager.detachBookmarkTab(id) {
-                tabManager.insertBookmarkTab(live, bookmarkID: id)
-            }
-        }
         // The target that line came from, so the landing is where the line showed; the old reading is only for a
         // pointer that resolved nowhere.
         let landing = drop.map { (section: $0.section, index: $0.index, folder: $0.folder) }
             ?? sidebar.list.dropTarget(at: screenPoint, allowsPinned: true)
         let space = tabManager.currentSpaceID
         window?.makeKeyAndOrderFront(nil)
-        if landing.section == .bookmarks {
-            pageChange(String(localized: "Move Pinned Tab", comment: "Undo action name, shown in the Edit menu as Undo Move Pinned Tab.")) { Library.shared.moveBookmark(bookmarkID, to: landing.index, in: space, folder: .some(landing.folder)) }
-            return sidebar.list.row(forBookmark: bookmarkID)
+        // A pinned page whose page is open carries that page across profiles, so it asks the question a tab asks. The
+        // page is loaded on either side: the window it came from and the one it goes to.
+        let open = openPages(ids, from: source)
+        confirmProfileCrossing(open, count: ids.count, from: Library.shared.spaceID(ofBookmark: bookmarkID) ?? source.tabManager.currentSpaceID,
+                               to: space) { [weak self] in
+            guard let self else { return }
+            // Sharing windows have the same pages (#162): nothing to bring over.
+            for id in ids where source.tabManager.store !== self.tabManager.store {
+                if self.tabManager.bookmarkTab(for: id) != nil {
+                    if let live = source.tabManager.bookmarkTab(for: id) { source.tabManager.close(live) }
+                } else if let live = source.tabManager.detachBookmarkTab(id) {
+                    self.tabManager.insertBookmarkTab(live, bookmarkID: id)
+                }
+            }
+            if landing.section == .bookmarks {
+                self.pageChange(String(localized: "Move Pinned Tab", comment: "Undo action name, shown in the Edit menu as Undo Move Pinned Tab.")) {
+                    Library.shared.moveBookmark(bookmarkID, to: landing.index, in: space, folder: .some(landing.folder))
+                }
+            } else {
+                self.pageChange(SavePath.unsaveName) { [tabManager = self.tabManager] in
+                    // Into this space first, so it comes down among the tabs you're looking at.
+                    Library.shared.moveBookmark(bookmarkID, to: Int.max, in: space)
+                    tabManager.unbookmark(bookmarkID, toIndex: landing.index)
+                }
+            }
         }
-        pageChange(SavePath.unsaveName) { [tabManager] in
-            // Into this space first, so it comes down among the tabs you're looking at.
-            Library.shared.moveBookmark(bookmarkID, to: Int.max, in: space)
-            tabManager.unbookmark(bookmarkID, toIndex: landing.index)
+        guard landing.section == .bookmarks else { return nil }
+        return sidebar.list.row(forBookmark: bookmarkID)
+    }
+
+    /// A whole picked selection, or a folder, dropped into this window's pinned rows from another window: every row
+    /// lands in the place that line showed, in one change, after the one profile question for the open pages behind it.
+    func listMovePickedToWindow(_ items: [SidebarItem], around dragged: SidebarItem, to drop: SidebarDrop,
+                                from source: BrowserWindowController) -> NSView? {
+        guard !tabManager.isPrivate, !source.tabManager.isPrivate,
+              drop.section == .bookmarks || drop.section == .tabs else { return nil }
+        // A live folder fills itself: a picked set never files pages into one.
+        if let folder = drop.folder, Library.shared.folder(folder)?.live != nil { return nil }
+        let space = tabManager.currentSpaceID
+        window?.makeKeyAndOrderFront(nil)
+        let open = pickedOpenPages(items, from: source)
+        confirmProfileCrossing(open, count: items.count, from: source.tabManager.currentSpaceID, to: space) { [weak self] in
+            guard let self else { return }
+            // Windows that don't share a store hand their tabs over first; a shared one already has them.
+            let tabs = items.compactMap { item -> Tab? in
+                guard case .tab(let id) = item else { return nil }
+                return source.tabManager.tab(with: id)
+            }
+            if self.tabManager.store !== source.tabManager.store, !tabs.isEmpty {
+                source.move(tabs, to: self, at: 0)
+            }
+            if drop.section == .bookmarks {
+                let hasTabs = items.contains { if case .tab = $0 { true } else { false } }
+                if hasTabs {
+                    self.movePickedNow(items, around: dragged, to: drop, in: space)
+                } else {
+                    let name = String(localized: "Move Picked Rows", comment: "Undo action name, shown in the Edit menu as Undo Move Picked Rows.")
+                    let before = Library.shared.snapshot
+                    self.performPickedMove(items, around: dragged, to: drop, in: space)
+                    guard before != Library.shared.snapshot else { return }
+                    self.registerPinnedUndo(name: name, before: before, with: source)
+                }
+            } else {
+                self.movePickedToTabs(items, at: drop.index, in: space)
+            }
         }
-        let tabs = tabManager.tabs(in: space)
-        return tabs.indices.contains(landing.index) ? sidebar.list.row(for: tabs[landing.index]) : nil
+        return landingRow(for: dragged)
+    }
+
+    /// A picked set of pinned rows only, dropped into this window's space from another window: every row moves to
+    /// that space's Pinned in the selection's order, in one change. It moves each row itself, so no row can be lost to
+    /// a place transaction worked out before the profile question.
+    func listMovePinnedSetToWindow(_ items: [SidebarItem], from source: BrowserWindowController) -> NSView? {
+        #if DEBUG
+        zzDragLog("pinnedset called items=\(items.count)")
+        #endif
+        guard !tabManager.isPrivate, !source.tabManager.isPrivate else { return nil }
+        let space = tabManager.currentSpaceID
+        window?.makeKeyAndOrderFront(nil)
+        let open = pickedOpenPages(items, from: source)
+        confirmProfileCrossing(open, count: items.count, from: source.tabManager.currentSpaceID, to: space) { [weak self] in
+            guard let self else { return }
+            let name = String(localized: "Move Picked Rows", comment: "Undo action name, shown in the Edit menu as Undo Move Picked Rows.")
+            let before = Library.shared.snapshot
+            Library.shared.together {
+                for item in items {
+                    switch item {
+                    case .bookmark(let id):
+                        if Library.shared.spaceID(ofBookmark: id) != space {
+                            Library.shared.moveBookmark(id, to: Int.max, in: space)
+                        }
+                    case .folder:
+                        self.bring(item, to: space)
+                    default:
+                        break
+                    }
+                }
+            }
+            guard before != Library.shared.snapshot else { return }
+            self.registerPinnedUndo(name: name, before: before, with: source)
+        }
+        return nil
+    }
+
+    /// One pinned move across windows, undone from either window that took part.
+    private func registerPinnedUndo(name: String, before: Library.Snapshot, with other: BrowserWindowController) {
+        let shared = CrossWindowPinnedUndo(before: before)
+        for controller in [self, other] {
+            controller.sidebarUndo.registerUndo(withTarget: controller) { target in
+                guard !shared.used else { return }
+                shared.used = true
+                Library.shared.restore(shared.before)
+                target.sidebarUndo.setActionName(name)
+            }
+            controller.sidebarUndo.setActionName(name)
+        }
+    }
+
+    /// A library-only change, undone from every window: ⌘Z in any window restores it, and the other windows' entries
+    /// then do nothing. A menu that moves pinned rows between spaces uses this, as a drag registers on both windows.
+    func libraryChangeEverywhere(_ name: String, _ change: @escaping () -> Void) {
+        let before = Library.shared.snapshot
+        change()
+        guard before != Library.shared.snapshot else { return }
+        let shared = CrossWindowPinnedUndo(before: before)
+        for controller in WindowManager.shared.controllers {
+            controller.sidebarUndo.registerUndo(withTarget: controller) { target in
+                guard !shared.used else { return }
+                shared.used = true
+                Library.shared.restore(shared.before)
+                target.sidebarUndo.setActionName(name)
+            }
+            controller.sidebarUndo.setActionName(name)
+        }
+    }
+
+    #if DEBUG
+    /// For a script: the tabs-section bulk move, without a drag or a profile sheet.
+    func debugMovePickedToTabs(_ items: [SidebarItem], at index: Int, in spaceID: UUID) {
+        movePickedToTabs(items, at: index, in: spaceID)
+    }
+    #endif
+
+    /// A picked set dropped into this window's tabs: every tab moves there, and every picked pinned page comes down
+    /// as a tab, in the selection's order, all in one change. A folder stays among the pinned rows and is left here.
+    private func movePickedToTabs(_ items: [SidebarItem], at index: Int, in space: UUID) {
+        #if DEBUG
+        zzDragLog("tabs items=\(items.count) index=\(index) space=\(space)")
+        #endif
+        pageChange(String(localized: "Move Picked Rows", comment: "Undo action name, shown in the Edit menu as Undo Move Picked Rows.")) { [self] in
+            var at = index
+            for item in items {
+                switch item {
+                case .tab(let id):
+                    guard let tab = tabManager.tab(with: id) else { continue }
+                    if tab.spaceID == space { tabManager.move(tab, to: at) } else { tabManager.move(tab, to: at, in: space) }
+                    at += 1
+                case .bookmark(let id):
+                    if Library.shared.spaceID(ofBookmark: id) != space {
+                        Library.shared.moveBookmark(id, to: Int.max, in: space)
+                    }
+                    if tabManager.unbookmark(id, toIndex: at) != nil { at += 1 }
+                default:
+                    continue
+                }
+            }
+        }
+    }
+
+    /// The open pages behind these pinned pages, looked for in both windows.
+    private func openPages(_ ids: [UUID], from source: BrowserWindowController) -> [Tab] {
+        var found: [Tab] = []
+        var seen = Set<UUID>()
+        for id in ids {
+            for tab in [tabManager.bookmarkTab(for: id), source.tabManager.bookmarkTab(for: id)].compactMap({ $0 })
+            where seen.insert(tab.id).inserted { found.append(tab) }
+        }
+        return found
+    }
+
+    /// The open pages behind a picked selection: its tabs, its pinned pages (a split's other half included) and every
+    /// page inside a picked folder, looked for in both windows.
+    private func pickedOpenPages(_ items: [SidebarItem], from source: BrowserWindowController) -> [Tab] {
+        var ids: [UUID] = []
+        for item in items {
+            switch item {
+            case .bookmark(let id):
+                ids += Library.shared.pinnedSplit(containing: id).map(\.ids) ?? [id]
+            case .folder(let id):
+                ids += Library.shared.allBookmarkIDs(inFolder: id)
+            default:
+                break
+            }
+        }
+        var found = openPages(ids, from: source)
+        var seen = Set(found.map(\.id))
+        for item in items {
+            guard case .tab(let id) = item else { continue }
+            for tab in [source.tabManager.tab(with: id), tabManager.tab(with: id)].compactMap({ $0 })
+            where seen.insert(tab.id).inserted { found.append(tab) }
+        }
+        return found
+    }
+
+    /// The row a picked row has in this window after a move: its pinned row, its folder's row, or a tab's pinned row.
+    private func landingRow(for item: SidebarItem) -> NSView? {
+        switch item {
+        case .bookmark(let id):
+            return sidebar.list.row(forBookmark: id)
+        case .folder(let id):
+            return sidebar.list.folderRow(id)
+        case .tab(let id):
+            return tabManager.tab(with: id)?.bookmarkID.flatMap { sidebar.list.row(forBookmark: $0) }
+        default:
+            return nil
+        }
     }
 
     /// A favorite carried over from another window's Favorites: its open pages come along (one already open here
     /// stays instead), it lands as it would from this window's own, and this window comes forward.
     func takeFavorite(_ favorite: Bookmark, from source: BrowserWindowController, at screenPoint: NSPoint) -> NSView? {
+        guard !tabManager.isPrivate, !source.tabManager.isPrivate else { return nil }
         let ids = Library.shared.favoriteSplits.first { $0.contains(favorite.id) }.map(\.ids) ?? [favorite.id]
-        for id in ids where source.tabManager.store !== tabManager.store {
-            if tabManager.bookmarkTab(for: id) != nil {
-                if let live = source.tabManager.bookmarkTab(for: id) { source.tabManager.close(live) }
-            } else if let live = source.tabManager.detachBookmarkTab(id) {
-                tabManager.insertBookmarkTab(live, bookmarkID: id)
-            }
-        }
-        let row = dropFavorite(favorite, at: screenPoint, to: sidebar.list.externalDropTarget)
+        let space = tabManager.currentSpaceID
         window?.makeKeyAndOrderFront(nil)
-        return row
+        let open = openPages(ids, from: source)
+        confirmProfileCrossing(open, count: ids.count, from: source.tabManager.currentSpaceID, to: space) { [weak self] in
+            guard let self else { return }
+            for id in ids where source.tabManager.store !== self.tabManager.store {
+                if self.tabManager.bookmarkTab(for: id) != nil {
+                    if let live = source.tabManager.bookmarkTab(for: id) { source.tabManager.close(live) }
+                } else if let live = source.tabManager.detachBookmarkTab(id) {
+                    self.tabManager.insertBookmarkTab(live, bookmarkID: id)
+                }
+            }
+            _ = self.dropFavorite(favorite, at: screenPoint, to: self.sidebar.list.externalDropTarget)
+        }
+        return nil
     }
 
     /// The star at the end of the address (#326) and the share button beside it: the star is the quick save, or with ⇧
@@ -3684,7 +3897,7 @@ extension BrowserWindowController: SidebarDelegate {
                       then done: (() -> Void)? = nil) {
         // To a space on another profile, an open page reloads there: that's asked first, wherever the move began (a
         // menu, a drag, the command bar).
-        confirmProfileCrossing(tabManager.panes(of: tab), to: spaceID) { [weak self] in
+        confirmProfileCrossing(tabManager.panes(of: tab), count: tabManager.panes(of: tab).count, from: tab.spaceID, to: spaceID) { [weak self] in
             self?.moveNow(tab, to: index, in: spaceID, nesting: nesting, grouping: grouping)
             done?()
         }
@@ -3693,15 +3906,20 @@ extension BrowserWindowController: SidebarDelegate {
     /// Asks before pages that are loaded move to a space on another profile, where they're rebuilt with that
     /// profile's sign-ins and extensions; `move` runs at once when nothing would change profile. Undoing such a
     /// move doesn't ask: it only puts back what was.
-    func confirmProfileCrossing(_ tabs: [Tab], to spaceID: UUID, then move: @escaping () -> Void) {
+    func confirmProfileCrossing(_ tabs: [Tab], count: Int? = nil, from sourceSpace: UUID? = nil, to spaceID: UUID,
+                                then move: @escaping () -> Void) {
         // Not moved after all: a row dragged there goes back to where it was.
-        ProfileSheets.confirmCrossing(tabs, to: spaceID, in: root.overlay, cancelled: { [weak self] in self?.sidebar.list.reload(animated: true) }, then: move)
+        ProfileSheets.confirmCrossing(tabs, count: count, from: sourceSpace, to: spaceID, in: root.overlay,
+                                      cancelled: { [weak self] in self?.sidebar.list.reload(animated: true) }, then: move)
     }
 
-    /// The same question for a pinned page, whose open page goes where it does.
-    private func confirmProfileCrossing(pinned id: UUID, to spaceID: UUID, then move: @escaping () -> Void) {
+    /// The same question for a pinned page, whose open page goes where it does, and whose space can cross profiles
+    /// even when the page is not loaded.
+    private func confirmProfileCrossing(pinned id: UUID, from sourceSpace: UUID? = nil, to spaceID: UUID,
+                                        then move: @escaping () -> Void) {
         let ids = Library.shared.pinnedSplit(containing: id).map(\.ids) ?? [id]
-        confirmProfileCrossing(ids.compactMap { tabManager.bookmarkTab(for: $0) }, to: spaceID, then: move)
+        confirmProfileCrossing(ids.compactMap { tabManager.bookmarkTab(for: $0) }, count: ids.count,
+                               from: sourceSpace ?? Library.shared.spaceID(ofBookmark: id), to: spaceID, then: move)
     }
 
     private func moveNow(_ tab: Tab, to index: Int, in spaceID: UUID, nesting: TabManager.Nesting, grouping: TabManager.Grouping) {
@@ -3743,7 +3961,7 @@ extension BrowserWindowController: SidebarDelegate {
     func listPinGroup(_ id: UUID, at index: Int, in spaceID: UUID, folder parent: UUID?) {
         guard !tabManager.isPrivate, let first = tabManager.tabs(inGroup: id).first, tabManager.canPin(first) else { return }
         let tabs = tabManager.tabs(inGroup: id)
-        confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), to: spaceID) { [weak self] in
+        confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), count: tabs.count, from: tabs.first?.spaceID ?? tabManager.currentSpaceID, to: spaceID) { [weak self] in
             guard let self else { return }
             Tutorial.complete("pin")
             pageChange(Self.pinGroupUndoName) { [tabManager] in
@@ -3812,6 +4030,7 @@ extension BrowserWindowController: SidebarDelegate {
         guard row?.window === window || tab == nil else { return }
         previews.hover(tab, row: row, bookmark: bookmark)
     }
+
     func listDragHoverSpace(at windowPoint: NSPoint) -> UUID? {
         // The same dot holds still: only a move onto another one, or off them, changes what is lit.
         if let dragDot, dragDot.rect.contains(windowPoint) { return dragDot.space }
@@ -3872,9 +4091,119 @@ extension BrowserWindowController: SidebarDelegate {
             pageChange(name, change)
         }
     }
+    /// Several picked rows dropped among the pinned rows: the primary row at the drop, the rest around it in list
+    /// order, all in one change. A picked folder carries its pages and subfolders; a picked tab pins on the way.
+    func listMovePicked(_ items: [SidebarItem], around dragged: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) {
+        guard !tabManager.isPrivate, drop.section == .bookmarks else { return }
+        // A live folder fills itself: a picked set never files pages into one.
+        if let folder = drop.folder, Library.shared.folder(folder)?.live != nil { return }
+        // Every open page behind the picked rows: their tabs, their pinned pages (a split's other half included) and
+        // the pages inside a picked folder, which the folder carries with it. The question is asked once for all of
+        // them, as a single pinned page asks it for its own open page.
+        var open = markedTabRows(items)
+        var seen = Set(open.map(\.id))
+        let pinned = markedPinPages(markedPinRows(items))
+            + markedFolderRows(items).flatMap { Library.shared.allBookmarkIDs(inFolder: $0) }
+        for id in pinned {
+            guard let tab = tabManager.bookmarkTab(for: id), seen.insert(tab.id).inserted else { continue }
+            open.append(tab)
+        }
+        confirmProfileCrossing(open, count: items.count, from: tabManager.currentSpaceID, to: spaceID) { [weak self] in
+            self?.movePickedNow(items, around: dragged, to: drop, in: spaceID)
+        }
+    }
+
+    /// A picked selection dropped on a space's dot: one profile question for all its open pages, then every row
+    /// moves to that space in one change.
+    func listMovePickedToSpace(_ items: [SidebarItem], spaceID: UUID) {
+        guard !tabManager.isPrivate else { return }
+        let open = pickedOpenPages(items, from: self)
+        confirmProfileCrossing(open, count: items.count, from: tabManager.currentSpaceID, to: spaceID) { [weak self] in
+            guard let self else { return }
+            self.pageChange(String(localized: "Move Picked Rows", comment: "Undo action name, shown in the Edit menu as Undo Move Picked Rows.")) {
+                for item in items {
+                    switch item {
+                    case .tab(let id):
+                        if let tab = self.tabManager.tab(with: id), tab.spaceID != spaceID {
+                            self.tabManager.moveTabToSpace(tab, spaceID: spaceID, at: Int.max)
+                        }
+                    case .bookmark(let id):
+                        if Library.shared.spaceID(ofBookmark: id) != spaceID {
+                            Library.shared.moveBookmark(id, to: Int.max, in: spaceID)
+                        }
+                    case .folder(let id):
+                        if !Library.shared.folders(in: spaceID).contains(where: { $0.id == id }) {
+                            Library.shared.moveFolder(id, to: Int.max, in: spaceID, parent: nil)
+                        }
+                    default: break
+                    }
+                }
+            }
+        }
+    }
+
+    private func movePickedNow(_ items: [SidebarItem], around dragged: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) {
+        pageChange(String(localized: "Move Picked Rows", comment: "Undo action name, shown in the Edit menu as Undo Move Picked Rows.")) { [self] in
+            performPickedMove(items, around: dragged, to: drop, in: spaceID)
+        }
+    }
+
+    /// The rows themselves, without an undo step of their own: the caller wraps them in the window whose undo should
+    /// take the move back.
+    private func performPickedMove(_ items: [SidebarItem], around dragged: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) {
+        #if DEBUG
+        zzDragLog("perform items=\(items.count) space=\(spaceID)")
+        #endif
+        Library.shared.together {
+            var pinned: [SidebarItem] = []
+            var primary = dragged
+            for item in items {
+                switch item {
+                case .bookmark, .folder:
+                    bring(item, to: spaceID)
+                    pinned.append(item)
+                case .tab(let id):
+                    guard let tab = tabManager.tab(with: id) else { continue }
+                    if tab.spaceID != spaceID { tabManager.moveTabToSpace(tab, spaceID: spaceID, at: 0) }
+                    if tab.bookmarkID == nil { tabManager.bookmarkTab(tab, at: Int.max, in: spaceID, keepingGroup: false) }
+                    guard let bookmarkID = tab.bookmarkID else { continue }
+                    let row = SidebarItem.bookmark(bookmarkID)
+                    pinned.append(row)
+                    if item == dragged { primary = row }
+                default:
+                    continue
+                }
+            }
+            guard let primaryRow = pinned.first(where: { $0 == primary }) else { return }
+            _ = Library.shared.movePicked(pinned, around: primaryRow, to: drop, in: spaceID)
+        }
+    }
+
+    /// A picked page or folder from another space comes into this one first, so the one place transaction can put it
+    /// where the line showed.
+    private func bring(_ item: SidebarItem, to spaceID: UUID) {
+        switch item {
+        case .bookmark(let id):
+            if Library.shared.spaceID(ofBookmark: id) != spaceID { Library.shared.moveBookmark(id, to: Int.max, in: spaceID) }
+        case .folder(let id):
+            if !Library.shared.folders(in: spaceID).contains(where: { $0.id == id }) {
+                Library.shared.moveFolder(id, to: Int.max, in: spaceID, parent: nil)
+            }
+        default:
+            break
+        }
+    }
+
     func listMoveFolder(_ id: UUID, to index: Int, in spaceID: UUID, parent: UUID?) {
         guard !tabManager.isPrivate else { return }
-        pageChange(parent == nil ? String(localized: "Move Folder", comment: "Undo action name, shown in the Edit menu as Undo Move Folder.") : String(localized: "Move into Folder", comment: "Undo action name, shown in the Edit menu as Undo Move into Folder.")) { Library.shared.moveFolder(id, to: index, in: spaceID, parent: .some(parent)) }
+        let name = parent == nil
+            ? String(localized: "Move Folder", comment: "Undo action name, shown in the Edit menu as Undo Move Folder.")
+            : String(localized: "Move into Folder", comment: "Undo action name, shown in the Edit menu as Undo Move into Folder.")
+        // A folder with no open page still crosses profiles when its space moves to one, so the question is asked for
+        // the folder itself.
+        confirmProfileCrossing([], count: 1, from: tabManager.currentSpaceID, to: spaceID) { [weak self] in
+            self?.pageChange(name) { Library.shared.moveFolder(id, to: index, in: spaceID, parent: .some(parent)) }
+        }
     }
     func listSetFolderOpen(_ id: UUID, _ open: Bool) {
         // Opening and closing isn't an edit to undo. Shut on purpose, it hides its pages that are open now, in any
@@ -3905,8 +4234,8 @@ extension BrowserWindowController: SidebarDelegate {
         tabManager.forgetClosedPins(ids)
         for controller in WindowManager.shared.controllers where controller !== self { controller.tabManager.forgetClosedPins(ids) }
     }
-    /// Sorts a space's pinned folders and pages by name, at every level: one change, one undo step. A private window
-    /// keeps its pins as they are.
+    /// Sorts a space's pinned folders and pages by name, at every level: one change, one ⌘Z. A private window keeps
+    /// its pins as they are.
     func sortPinnedTabs(in spaceID: UUID) {
         guard !tabManager.isPrivate else { return }
         let name = String(localized: "Sort Alphabetically", comment: "Undo action name, shown in the Edit menu as Undo Sort Alphabetically.")
@@ -3953,7 +4282,7 @@ extension BrowserWindowController: SidebarDelegate {
     }
     func listMoveGroup(_ id: UUID, to index: Int, in spaceID: UUID) {
         let tabs = tabManager.tabs(inGroup: id)
-        confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), to: spaceID) { [weak self] in
+        confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), count: tabs.count, from: tabs.first?.spaceID ?? tabManager.currentSpaceID, to: spaceID) { [weak self] in
             guard let self else { return }
             pageChange(spaceID == tabs.first?.spaceID ? String(localized: "Move Group", comment: "Undo action name, shown in the Edit menu as Undo Move Group.")
                        : String(localized: "Move to Space", comment: "Undo action name, shown in the Edit menu as Undo Move to Space.")) { [tabManager] in
@@ -3963,7 +4292,8 @@ extension BrowserWindowController: SidebarDelegate {
     }
     func listAddToGroup(_ tabs: [Tab], group: UUID) {
         let space = tabManager.tabs(inGroup: group).first?.spaceID ?? tabManager.currentSpaceID
-        confirmProfileCrossing(tabs.filter { $0.spaceID != space }.flatMap(tabManager.panes(of:)), to: space) { [weak self] in
+        confirmProfileCrossing(tabs.filter { $0.spaceID != space }.flatMap(tabManager.panes(of:)), count: tabs.count,
+                               from: tabManager.currentSpaceID, to: space) { [weak self] in
             guard let self else { return }
             pageChange(String(localized: "Add to Group", comment: "Undo action name, shown in Edit › Undo.")) { [tabManager] in
                 for tab in tabs where tab.bookmarkID == nil {
@@ -4157,7 +4487,8 @@ extension BrowserWindowController: SidebarDelegate {
         if let over, over !== self {
             guard !over.tabManager.isPrivate else { return false }
             over.window?.makeKeyAndOrderFront(nil)
-            over.confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), to: over.tabManager.currentSpaceID) { [weak self, weak over] in
+            over.confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), count: tabs.count,
+                                        from: tabManager.currentSpaceID, to: over.tabManager.currentSpaceID) { [weak self, weak over] in
                 guard let self, let over else { return }
                 self.move(tabs, to: over, at: 0)
             }
@@ -4446,7 +4777,8 @@ extension BrowserWindowController: SidebarDelegate {
         guard !tabManager.isPrivate, !controller.tabManager.isPrivate else { return false }
         controller.window?.makeKeyAndOrderFront(nil)
         let space = controller.tabManager.currentSpaceID
-        controller.confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), to: space) { [weak self, weak controller] in
+        controller.confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), count: tabs.count,
+                                          from: tabManager.currentSpaceID, to: space) { [weak self, weak controller] in
             guard let self, let controller else { return }
             guard controller.tabManager.store === self.tabManager.store, let first = tabs.first else {
                 self.move(tabs, to: controller, at: index)
@@ -4497,6 +4829,8 @@ extension BrowserWindowController: SidebarDelegate {
     }
 
     func listSwitchSpaceDuringDrag(_ spaceID: UUID) {
+        // The dots have changed places with the list, so where each one sits is read again.
+        dragDot = nil
         // Switch without changing the selected tab, so the page doesn't jump while you drag.
         tabManager.showSpaceKeepingPage(spaceID)
     }

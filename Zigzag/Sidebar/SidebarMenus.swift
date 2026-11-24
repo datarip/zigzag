@@ -133,7 +133,10 @@ enum SidebarMenus {
         let manager = controller.tabManager
         let rows = controller.markedTabRows(items)
         let pins = controller.markedPinRows(items)
+        let folders = controller.markedFolderRows(items)
         let count = items.count
+        // Folders have no tile in the favorites grid, so the item counts only the rows it can take.
+        let favoritesCount = items.filter(\.canBeFavorite).count
         // A private window's tabs never join the pins and favorites every window shares.
         let isPrivate = manager.isPrivate
         var page: [NSMenuItem] = []
@@ -155,15 +158,17 @@ enum SidebarMenus {
                 controller.unpinMarked(pins)
             })
         }
-        if !isPrivate {
-            organize.append(Item(String(localized: "Add \(count) to Favorites", comment: "Menu item for several picked sidebar rows"), symbol: Symbol.favorite) {
+        if !isPrivate, favoritesCount > 0 {
+            organize.append(Item(String(localized: "Add \(favoritesCount) to Favorites", comment: "Menu item for several picked sidebar rows"), symbol: Symbol.favorite) {
                 controller.favoriteMarked(items)
             })
         }
         if !isPrivate {
+            // A folder cannot go inside itself or a folder inside it, so neither is offered.
+            let blocked = Set(folders + folders.flatMap { Library.shared.subfolderIDs(of: $0) })
             organize += folderItems(new: String(localized: "Add \(count) to New Folder", comment: "Menu item for several picked sidebar rows"),
                                     add: String(localized: "Add \(count) to Folder", comment: "Menu item for several picked sidebar rows"),
-                                    folders: Library.shared.folders(in: manager.currentSpaceID),
+                                    folders: Library.shared.folders(in: manager.currentSpaceID).filter { !blocked.contains($0.id) },
                                     new: { controller.fileMarked(items, in: nil) }, into: { controller.fileMarked(items, in: $0.id) })
         }
         if !rows.isEmpty {
@@ -397,8 +402,9 @@ enum SidebarMenus {
                 organize.append(Submenu(String(localized: "Move to Space", comment: "Item in a pinned tab's context menu in the sidebar. Opens a list of spaces."), symbol: Symbol.moveTo,
                                         spaceItems(excluding: Library.shared.spaceID(ofBookmark: bookmark.id)) { space in
                     // Its open page goes with it: to another profile's space, that's asked first.
-                    controller.confirmProfileCrossing([live].compactMap { $0 }, to: space.id) {
-                        controller.libraryChange(String(localized: "Move to Space", comment: "Undo action name, shown in Edit › Undo.")) { Library.shared.moveBookmark(bookmark.id, to: Int.max, in: space.id) }
+                    controller.confirmProfileCrossing([live].compactMap { $0 }, count: 1,
+                                                        from: Library.shared.spaceID(ofBookmark: bookmark.id), to: space.id) {
+                        controller.libraryChangeEverywhere(String(localized: "Move to Space", comment: "Undo action name, shown in Edit › Undo.")) { Library.shared.moveBookmark(bookmark.id, to: Int.max, in: space.id) }
                     }
                 }))
             }
@@ -868,6 +874,11 @@ extension BrowserWindowController {
         items.compactMap { item in if case .bookmark(let id) = item { id } else { nil } }
     }
 
+    /// The folder of each picked folder row.
+    func markedFolderRows(_ items: [SidebarItem]) -> [UUID] {
+        items.compactMap { item in if case .folder(let id) = item { id } else { nil } }
+    }
+
     /// Every pinned page in these rows, all of a pinned split or group.
     func markedPinPages(_ pins: [UUID]) -> [UUID] {
         pins.flatMap { id in Library.shared.pinnedSplit(containing: id).map(\.ids) ?? [id] }
@@ -898,23 +909,37 @@ extension BrowserWindowController {
         sidebar.list.mark(pages: tabs)
     }
 
-    /// Into a folder of this space (nil: a new one, named right away), the tabs among them pinned first.
+    /// Into a folder of this space (nil: a new one, named right away), the tabs among them pinned first and the picked
+    /// folders moved whole, each with what is inside it.
     func fileMarked(_ items: [SidebarItem], in folder: UUID?) {
         guard !tabManager.isPrivate else { return }
+        let space = tabManager.currentSpaceID
         var ids: [UUID] = []
+        var movedFolders: [UUID] = []
         var made: BookmarkFolder?
         pageChange(folder == nil ? String(localized: "New Folder", comment: "Undo action name, shown in Edit › Undo.") : String(localized: "Add to Folder", comment: "Undo action name, shown in Edit › Undo.")) { [self] in
             Library.shared.together {
                 ids = pinnedIDs(for: items)
+                let folders = markedFolderRows(items)
+                let target: UUID?
                 if let folder {
-                    for id in ids { Library.shared.setFolder(of: id, to: folder) }
+                    target = folder
                 } else {
-                    made = Library.shared.addFolder(named: String(localized: "New Folder", comment: "Name a new folder of pinned tabs gets, until it's renamed."), with: ids, in: tabManager.currentSpaceID)
+                    made = Library.shared.addFolder(named: String(localized: "New Folder", comment: "Name a new folder of pinned tabs gets, until it's renamed."), with: ids, in: space)
+                    target = made?.id
+                }
+                for id in ids {
+                    if let target { Library.shared.setFolder(of: id, to: target) }
+                }
+                guard let target else { return }
+                for id in folders where id != target && !Library.shared.subfolderIDs(of: id).contains(target) {
+                    Library.shared.moveFolder(id, to: Int.max, in: space, parent: .some(target))
+                    movedFolders.append(id)
                 }
             }
         }
         if let made { revealNewFolder(made.id) }
-        sidebar.list.mark(pins: ids)
+        sidebar.list.mark(pins: ids, folders: movedFolders)
     }
 
     /// Into the favorites, in order. They leave the list for the grid, so nothing stays picked.
@@ -942,17 +967,31 @@ extension BrowserWindowController {
         let tabs = markedTabRows(items)
         let pins = markedPinRows(items)
         let open = tabs + pins.compactMap { tabManager.bookmarkTab(for: $0) }
-        confirmProfileCrossing(open, to: spaceID) { [weak self] in self?.moveMarkedNow(items, tabs: tabs, pins: pins, to: spaceID, name: name) }
+        confirmProfileCrossing(open, count: items.count, from: tabManager.currentSpaceID, to: spaceID) { [weak self] in
+            self?.moveMarkedNow(items, tabs: tabs, pins: pins, to: spaceID, name: name)
+        }
     }
 
     private func moveMarkedNow(_ items: [SidebarItem], tabs: [Tab], pins: [UUID], to spaceID: UUID, name: String) {
-        pageChange(String(localized: "Move to Space", comment: "Undo action name, shown in Edit › Undo.")) { [tabManager] in
-            Library.shared.together {
-                for tab in tabs.reversed() { tabManager.moveTabToSpace(tab, spaceID: spaceID, at: 0) }
-                var at = 0
-                for id in pins {
-                    Library.shared.moveBookmark(id, to: at, in: spaceID)
-                    at += Library.shared.pinnedSplit(containing: id)?.ids.count ?? 1
+        let undoName = String(localized: "Move to Space", comment: "Undo action name, shown in Edit › Undo.")
+        let movePinned = {
+            var at = 0
+            for id in pins {
+                Library.shared.moveBookmark(id, to: at, in: spaceID)
+                at += Library.shared.pinnedSplit(containing: id)?.ids.count ?? 1
+            }
+            for id in self.markedFolderRows(items) {
+                Library.shared.moveFolder(id, to: Int.max, in: spaceID, parent: nil)
+            }
+        }
+        if tabs.isEmpty {
+            // Pinned rows only: the library is shared, so every window registers the one undo and ⌘Z works in any.
+            libraryChangeEverywhere(undoName) { Library.shared.together(movePinned) }
+        } else {
+            pageChange(undoName) { [tabManager] in
+                Library.shared.together {
+                    for tab in tabs.reversed() { tabManager.moveTabToSpace(tab, spaceID: spaceID, at: 0) }
+                    movePinned()
                 }
             }
         }

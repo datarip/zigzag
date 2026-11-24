@@ -196,6 +196,8 @@ class InteractiveView: NSView {
     var onClick: ((NSEvent) -> Void)?
     var onDoubleClick: (() -> Void)?
     var onRightClick: ((NSEvent) -> NSMenu?)? { didSet { updateTouchMenu() } }
+    /// A menu shown the drawn way closed: true when an item was chosen, false when it was dismissed.
+    var onDrawnMenuClose: ((Bool) -> Void)?
     /// Called once the mouse moves far enough while pressed. Return true to take over the drag.
     var onDragStart: ((NSEvent) -> Bool)? { didSet { updateTouchMenu() } }
     /// A finger held and moved picks it up too, through `onDragStart`: only for drags run by `CarriedCopy.carry`,
@@ -569,7 +571,12 @@ class InteractiveView: NSView {
     }
 
     private func showDrawnMenu(_ menu: NSMenu, at windowPoint: NSPoint) {
-        MenuPanel.show(menu: menu, from: self, placement: .at(windowPoint))
+        var chose = false
+        let entries = MenuPanel.entries(from: menu) { chose = true }
+        guard !entries.isEmpty else { return }
+        MenuPanel.show(entries, from: self, placement: .at(windowPoint)) { [weak self] in
+            self?.onDrawnMenuClose?(chose)
+        }
     }
 
     override func accessibilityPerformShowMenu() -> Bool { showContextMenu() }
@@ -2057,7 +2064,8 @@ final class MenuPanel: FloatingPanelView {
 
     /// An AppKit menu's items as drawn entries: titles, pictures, checks, dimmed items, shortcuts, headers and
     /// submenus, each item doing what choosing it in the AppKit menu does.
-    static func entries(from menu: NSMenu) -> [Entry] {
+    /// `chose` runs when one of its items, at any depth, is chosen, before the item does its work.
+    static func entries(from menu: NSMenu, chose: (() -> Void)? = nil) -> [Entry] {
         var entries: [Entry] = []
         for item in menu.items where !item.isHidden {
             if item.isSeparatorItem {
@@ -2067,11 +2075,12 @@ final class MenuPanel: FloatingPanelView {
             }
             if item.isSectionHeader { entries.append(.header(item.title)); continue }
             let style = item.representedObject as? MenuItemStyle
-            let submenu = item.submenu.map(entries(from:))
+            let submenu = item.submenu.map { Self.entries(from: $0, chose: chose) }
             entries.append(.item(Item(title: item.title, image: style?.symbol == nil ? item.image : nil, symbol: style?.symbol,
                                       isChecked: item.state == .on, isDestructive: style?.isDestructive ?? false, isEnabled: item.isEnabled,
                                       shortcut: Shortcuts.caps(item).joined(), submenu: submenu) { [item] in
                 guard let action = item.action else { return }
+                chose?()
                 NSApp.sendAction(action, to: item.target, from: item)
             }))
         }

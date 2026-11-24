@@ -1009,7 +1009,7 @@ struct SidebarRowMenuTests {
                 SidebarMenus.bookmarkMenu(for: pin, controller: controller), SidebarMenus.favoriteMenu(for: favorite, controller: controller),
                 SidebarMenus.spaceMenu(for: space, controller: controller),
                 SidebarMenus.markedMenu(for: [.tab(tabs[0].id), .tab(tabs[1].id)], controller: controller),
-            ].map(MenuPanel.entries(from:))
+            ].map { MenuPanel.entries(from: $0) }
             if let resting { menus.append(MenuPanel.entries(from: SidebarMenus.bookmarkMenu(for: resting, controller: controller))) }
             menus += [SidebarMenus.addPanel(controller: controller), SidebarMenus.blankPanel(controller: controller)]
             @MainActor func items(_ entries: [MenuPanel.Entry]) -> [MenuPanel.Item] {

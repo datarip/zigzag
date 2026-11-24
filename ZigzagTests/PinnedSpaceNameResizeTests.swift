@@ -26,7 +26,7 @@ struct PinnedSpaceNameResizeTests {
         func listSetFolder(of bookmarkID: UUID, to folderID: UUID?) {}
         func listAsOne(_ name: String, _ body: @escaping () -> Void) { body() }
         func listMoveBookmark(_ id: UUID, to index: Int, in spaceID: UUID, folder: UUID?) {}
-        func listMovePinned(_ item: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) {}
+        func listMovePicked(_ items: [SidebarItem], around dragged: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) {}
         func listMoveFolder(_ id: UUID, to index: Int, in spaceID: UUID, parent: UUID?) {}
         func listHover(_ tab: Tab?, row: NSView?, bookmark: Bookmark?) {}
         func listMenu(for item: SidebarItem) -> NSMenu? { nil }

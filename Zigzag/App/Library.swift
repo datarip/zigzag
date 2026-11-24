@@ -1519,6 +1519,23 @@ final class Library {
         return true
     }
 
+    /// A whole picked selection dropped at one place: the primary row at the drop, the rest around it in list order.
+    /// One answer and one commit for every row, page and folder, so the caller records one undo step.
+    @discardableResult
+    func movePicked(_ picked: [SidebarItem], around dragged: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) -> Bool {
+        guard let s = index(of: spaceID) else { return false }
+        let place = PinnedPlace(pages: spaces[s].bookmarks.map(\.id), folders: spaces[s].folders ?? [],
+                                splits: spaces[s].pinnedSplits ?? [])
+        guard let moved = place.moved(picked, around: dragged, to: drop) else { return false }
+        let byID = Dictionary(spaces[s].bookmarks.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let pages = moved.pages.compactMap { byID[$0] }
+        guard pages.count == spaces[s].bookmarks.count else { return false }
+        spaces[s].bookmarks = pages
+        spaces[s].folders = moved.folders.isEmpty ? nil : moved.folders
+        commit()
+        return true
+    }
+
     // MARK: Folders
 
     func folders(in spaceID: UUID) -> [BookmarkFolder] { space(spaceID)?.folders ?? [] }

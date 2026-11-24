@@ -1128,6 +1128,25 @@ enum DebugBridge {
             let json: [String: Any] = ["marked": list.marked.map { String(describing: $0) }, "count": list.marked.count,
                                        "focus": list.marksHaveFocus, "menu": titles, "close": close?.title ?? ""]
             if let data = try? JSONSerialization.data(withJSONObject: json) { try? data.write(to: URL(fileURLWithPath: arg)) }
+        // movespace <space name>: moves the picked rows to that space, as dropping them on its dot does.
+        // movetotabs <space> <A,B,C>: the tabs-section bulk move for those pinned pages, without a drag.
+        case "movetotabs":
+            let f = arg.split(separator: " ", maxSplits: 1).map(String.init)
+            guard f.count == 2, let space = Library.shared.spaces.first(where: { $0.name == f[0] }) else { break }
+            let titles = f[1].split(separator: ",").map(String.init)
+            let ids = Library.shared.bookmarks(in: controller.tabManager.currentSpaceID)
+                .filter { titles.contains($0.title) }.map(\.id)
+            controller.debugMovePickedToTabs(ids.map(SidebarItem.bookmark), at: 0, in: space.id)
+        // markpins <B,C,D>: marks those pinned pages, as CMD-clicking each does.
+        case "markpins":
+            let titles = arg.split(separator: ",").map(String.init)
+            let ids = Library.shared.bookmarks(in: controller.tabManager.currentSpaceID)
+                .filter { titles.contains($0.title) }.map(\.id)
+            controller.sidebar.list.mark(pins: ids)
+            debugLog("markpins -> \(ids.count)")
+        case "movespace":
+            guard let space = Library.shared.spaces.first(where: { $0.name == arg }) else { break }
+            controller.listMovePickedToSpace(controller.sidebar.list.marked, spaceID: space.id)
         case "markedmenu":
             // markedmenu <title>: runs that item of the picked rows' menu, as choosing it would (a submenu's by "Parent>Item").
             let list = controller.sidebar.list
@@ -2090,18 +2109,24 @@ enum DebugBridge {
             debugLog("pointermove heard by \(heard)")
         case "responder": debugLog("responder \(responderName(in: controller))")
         case "dragpath":
-            // dragpath x y1 y2: an in-app press at y1 dragged to y2 and let go (window points, top left).
+            // dragpath x y1 y2 | dragpath x1 y1 x2 y2: an in-app press dragged to the end and let go (window points,
+            // top left). Four numbers let it leave the window, for a drag into another window's sidebar.
             let n = arg.split(separator: " ").compactMap { Double($0) }
-            guard n.count == 3, let window = controller.window else { break }
-            func event(_ type: NSEvent.EventType, _ y: Double) -> NSEvent? {
-                NSEvent.mouseEvent(with: type, location: NSPoint(x: n[0], y: window.frame.height - y), modifierFlags: [],
+            guard n.count == 3 || n.count == 4, let window = controller.window else { break }
+            let start = NSPoint(x: n[0], y: n[1]), end = n.count == 4 ? NSPoint(x: n[2], y: n[3]) : NSPoint(x: n[0], y: n[2])
+            func event(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent? {
+                NSEvent.mouseEvent(with: type, location: NSPoint(x: point.x, y: window.frame.height - point.y), modifierFlags: [],
                                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                                    context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)
             }
-            event(.leftMouseDown, n[1]).map(window.sendEvent)
-            for step in 2...8 { event(.leftMouseDragged, n[1] + (n[2] - n[1]) * Double(step) / 8).map { NSApp.postEvent($0, atStart: false) } }
-            event(.leftMouseUp, n[2]).map { NSApp.postEvent($0, atStart: false) }
-            event(.leftMouseDragged, n[1] + (n[2] - n[1]) / 8).map(window.sendEvent)
+            event(.leftMouseDown, start).map(window.sendEvent)
+            for step in 2...8 {
+                let t = Double(step) / 8
+                event(.leftMouseDragged, NSPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t))
+                    .map { NSApp.postEvent($0, atStart: false) }
+            }
+            event(.leftMouseUp, end).map { NSApp.postEvent($0, atStart: false) }
+            event(.leftMouseDragged, NSPoint(x: start.x + (end.x - start.x) / 8, y: start.y + (end.y - start.y) / 8)).map(window.sendEvent)
             debugLog("dragpath \(arg) done")
         case "dragmeasure":
             // dragmeasure x y1 y2 [steps]: the drag `dragpath` makes, in that many moves (60 unless given), each one
@@ -2621,12 +2646,52 @@ enum DebugBridge {
             let frame = target.frame
             debugLog("droppage \(tab.displayTitle) handled=\(controller.listDropOutside([tab], at: NSPoint(x: frame.maxX - 200, y: frame.midY)))")
             WindowManager.shared.debugTarget = all[n - 1]
-        // hoverline <window> <x> <y>: that window's sidebar shows its line for a tab from another window carried to
-        // that point on screen (none: hidden), as during a drag.
+        // hoverline <window> <x> <y> [page|folder|tab <name>]: that window's sidebar shows its line for a row from
+        // another window carried to that point on screen (none: hidden), as during a drag. Without a name it carries a
+        // tab, as before.
         case "hoverline":
-            let f = arg.split(separator: " ").compactMap { Double($0) }, all = WindowManager.shared.controllers
-            guard let n = f.first.map(Int.init), all.indices.contains(n - 1) else { break }
-            all[n - 1].sidebar.list.externalHover(at: f.count == 3 ? NSPoint(x: f[1], y: f[2]) : nil)
+            let all = WindowManager.shared.controllers
+            let f = arg.split(separator: " ", maxSplits: 4).map(String.init)
+            guard let n = f.first.flatMap(Int.init), all.indices.contains(n - 1) else { break }
+            let target = all[n - 1]
+            var carrying: SidebarItem?
+            if f.count == 5 {
+                let name = f[4], space = target.tabManager.currentSpaceID
+                switch f[3] {
+                case "page": carrying = Library.shared.bookmarks(in: space).first { $0.title == name }.map { .bookmark($0.id) }
+                case "folder": carrying = Library.shared.folders(in: space).first { $0.name == name }.map { .folder($0.id) }
+                case "tab": carrying = target.tabManager.tabs(in: space).first { $0.displayTitle == name }.map { .tab($0.id) }
+                default: break
+                }
+            }
+            let point = f.count >= 4 ? NSPoint(x: Double(f[1]) ?? 0, y: Double(f[2]) ?? 0) : nil
+            target.sidebar.list.externalHover(at: point, allowsPinned: carrying != nil, carrying: carrying)
+        // hoverlineat <window> <x> <y> [page|folder|tab <name>]: as hoverline, with the point in the list's own
+        // coordinates, so a script can aim at a row's gap without converting through the window.
+        case "hoverlineat":
+            let all = WindowManager.shared.controllers
+            let f = arg.split(separator: " ", maxSplits: 4).map(String.init)
+            guard let n = f.first.flatMap(Int.init), all.indices.contains(n - 1), f.count >= 4 else { break }
+            let target = all[n - 1], list = target.sidebar.list
+            var carrying: SidebarItem?
+            if f.count == 5 {
+                let name = f[4], space = target.tabManager.currentSpaceID
+                switch f[3] {
+                case "page": carrying = Library.shared.bookmarks(in: space).first { $0.title == name }.map { .bookmark($0.id) }
+                case "folder": carrying = Library.shared.folders(in: space).first { $0.name == name }.map { .folder($0.id) }
+                case "tab": carrying = target.tabManager.tabs(in: space).first { $0.displayTitle == name }.map { .tab($0.id) }
+                default: break
+                }
+            }
+            let inList = NSPoint(x: Double(f[1]) ?? 0, y: Double(f[2]) ?? 0)
+            let inWindow = list.convert(inList, to: nil)
+            let screen = list.window?.convertPoint(toScreen: inWindow)
+            list.externalHover(at: screen, allowsPinned: carrying != nil, carrying: carrying)
+        // externalstate <window> <path>: the external line's resolved drop and frame, as one line, for a script.
+        case "externalstate":
+            let f = arg.split(separator: " ", maxSplits: 1).map(String.init), all = WindowManager.shared.controllers
+            guard let n = f.first.flatMap(Int.init), all.indices.contains(n - 1), f.count > 1 else { break }
+            try? all[n - 1].sidebar.list.debugExternalState().write(toFile: f[1], atomically: true, encoding: .utf8)
         // tabtomini [n] [x y]: the tab menu's Open in Zigzag Mini for the nth tab of this space (1 = the first; none:
         // the tab you're on), or, with a point on screen, the tab let go there with ⌥ held. Logs whether it's offered.
         case "tabtomini":

@@ -94,6 +94,31 @@ nonisolated struct PinnedLine {
     }
 }
 
+/// The rows a multi-row selection carries, and the order they land in. A picked folder carries every page and folder
+/// inside it, so none of them is also picked: the folder moves them with it, once.
+nonisolated enum PickedRows {
+    /// The picked rows, in list order, without the rows a picked folder already carries.
+    static func normalized(_ picked: [SidebarItem], folders: [BookmarkFolder]) -> [SidebarItem] {
+        let pickedFolders = picked.compactMap { item -> UUID? in
+            if case .folder(let id) = item { id } else { nil }
+        }
+        guard !pickedFolders.isEmpty else { return picked }
+        var inside: Set<SidebarItem> = []
+        for id in pickedFolders {
+            inside.formUnion(folders.descendants(of: id).map(SidebarItem.folder))
+            inside.formUnion(folders.pages(in: id).map(SidebarItem.bookmark))
+        }
+        return picked.filter { !inside.contains($0) }
+    }
+
+    /// The picked rows on either side of the row under the pointer, nearest first: the rows above it go before it, the
+    /// rows below after it, each in the order the sidebar draws them.
+    static func around(_ picked: [SidebarItem], primary: SidebarItem) -> (before: [SidebarItem], after: [SidebarItem]) {
+        guard let p = picked.firstIndex(of: primary) else { return ([], []) }
+        return (Array(picked[..<p].reversed()), Array(picked[(p + 1)...]))
+    }
+}
+
 /// A pinned tree as the place transaction sees it: the pages in list order, the folders and the splits. A drop is one
 /// call and one answer: the pages leave, go in where the line showed, the parent and every sibling's place are set, all
 /// together. There is no half-applied state, so a folder's place can never be read on one line and written on another.
@@ -265,6 +290,63 @@ struct PinnedPlace: Equatable {
         }
         for i in newFolders.indices { newFolders[i].bookmarkIDs = ordered[newFolders[i].id] ?? [] }
         return PinnedPlace(pages: newPages, folders: newFolders, splits: splits)
+    }
+
+    /// The tree a whole picked selection leaves, or nil when it leaves the tree as it is. The row under the pointer
+    /// lands at the drop first. Then the picked rows above it go just before it, nearest first, and the rows below go
+    /// just after it, nearest first. Each row is one call to `moved`, on the tree the last one left, so a folder still
+    /// carries its subtree and a row that cannot land is skipped without stopping the rest.
+    func moved(_ picked: [SidebarItem], around dragged: SidebarItem, to drop: SidebarDrop) -> PinnedPlace? {
+        let rows = PickedRows.normalized(picked, folders: folders)
+        // One row is the ordinary single move: the same transaction with the row at the drop. Two or more land around
+        // the dragged one below.
+        guard !rows.isEmpty, rows.contains(dragged) else { return nil }
+        let (before, after) = PickedRows.around(rows, primary: dragged)
+        var current = self
+        var changed = false
+        var anchor = dragged
+        if let next = current.moved(dragged, to: drop) {
+            current = next
+            changed = true
+        }
+        for item in before {
+            let index = current.index(beside: anchor, after: false, without: current.moving(item))
+            let beside = SidebarDrop(section: .bookmarks, index: index, folder: drop.folder,
+                                     place: .gap(above: nil, below: anchor, depth: 0))
+            guard let next = current.moved(item, to: beside) else { continue }
+            current = next
+            changed = true
+            anchor = item
+        }
+        for item in after {
+            let index = current.index(beside: anchor, after: true, without: current.moving(item))
+            let beside = SidebarDrop(section: .bookmarks, index: index, folder: drop.folder,
+                                     place: .gap(above: anchor, below: nil, depth: 0))
+            guard let next = current.moved(item, to: beside) else { continue }
+            current = next
+            changed = true
+            anchor = item
+        }
+        return changed ? current : nil
+    }
+
+    /// Where a row goes beside another on the page line, counted without the pages that are leaving with it: after the
+    /// other's whole block for `after`, before it otherwise. An empty folder has no page of its own, so the gap the drop
+    /// names is what places it.
+    func index(beside neighbor: SidebarItem, after: Bool, without carried: Set<UUID>) -> Int {
+        let reduced = pages.filter { !carried.contains($0) }
+        switch neighbor {
+        case .bookmark(let id):
+            guard let at = reduced.firstIndex(of: id) else { return after ? reduced.count : 0 }
+            return after ? at + 1 : at
+        case .folder(let id):
+            let inside = folders.pages(in: id)
+            let places = reduced.indices.filter { inside.contains(reduced[$0]) }
+            if let first = places.first, let last = places.last { return after ? last + 1 : first }
+            return reduced.count
+        default:
+            return reduced.count
+        }
     }
 
     /// The row a drop's `above` or `below` names: a split's lead, never its rider.

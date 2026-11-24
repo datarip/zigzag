@@ -1,6 +1,21 @@
 import AppKit
 import os
 
+#if DEBUG
+/// One line per drag decision, for tracking a cross-window move by hand. Appends to /tmp/zz-route.log.
+func zzDragLog(_ line: String) {
+    let url = URL(fileURLWithPath: "/tmp/zz-route.log")
+    let text = "\(Date()) \(line)\n"
+    if let handle = try? FileHandle(forWritingTo: url) {
+        handle.seekToEndOfFile()
+        handle.write(text.data(using: .utf8) ?? Data())
+        try? handle.close()
+    } else {
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+#endif
+
 protocol SidebarListDelegate: AnyObject {
     var tabManager: TabManager { get }
     func listSelect(_ tab: Tab)
@@ -32,6 +47,10 @@ protocol SidebarListDelegate: AnyObject {
     /// index and the rows on either side of the gap the line showed. One change, one ⌘Z, and nothing at all when the
     /// drop leaves the rows as they were.
     func listMovePinned(_ item: SidebarItem, to drop: SidebarDrop, in spaceID: UUID)
+    /// A whole picked selection onto the pinned side: the primary row at the drop and the rest around it, one change.
+    func listMovePicked(_ items: [SidebarItem], around dragged: SidebarItem, to drop: SidebarDrop, in spaceID: UUID)
+    /// A whole picked selection onto another space's dot: one profile question for all of it, one change.
+    func listMovePickedToSpace(_ items: [SidebarItem], spaceID: UUID)
     func listMoveFolder(_ id: UUID, to index: Int, in spaceID: UUID, parent: UUID?)
     func listHover(_ tab: Tab?, row: NSView?, bookmark: Bookmark?)
     func listMenu(for item: SidebarItem) -> NSMenu?
@@ -89,6 +108,23 @@ protocol SidebarListDelegate: AnyObject {
 }
 
 extension SidebarListDelegate {
+    /// One row at a time: each method asks its own profile question. A window with several picked rows overrides this
+    /// with one question for the lot.
+    func listMovePickedToSpace(_ items: [SidebarItem], spaceID: UUID) {
+        for item in items {
+            switch item {
+            case .tab(let id):
+                if let tab = tabManager.tab(with: id), tab.spaceID != spaceID { listMove(tab, to: Int.max, in: spaceID) }
+            case .bookmark(let id):
+                if Library.shared.spaceID(ofBookmark: id) != spaceID { listMoveBookmark(id, to: Int.max, in: spaceID) }
+            case .folder(let id):
+                if !Library.shared.folders(in: spaceID).contains(where: { $0.id == id }) {
+                    listMoveFolder(id, to: Int.max, in: spaceID, parent: nil)
+                }
+            default: break
+            }
+        }
+    }
     func listMove(_ tab: Tab, to index: Int, in spaceID: UUID) { listMove(tab, to: index, in: spaceID, nesting: .fit, grouping: .fit) }
     func listUnbookmark(_ bookmarkID: UUID, to index: Int) { listUnbookmark(bookmarkID, to: index, under: nil, group: nil) }
     func listMenu(for item: SidebarItem, page: Tab?) -> NSMenu? { listMenu(for: item) }
@@ -149,7 +185,7 @@ nonisolated enum SidebarItem: Hashable {
     /// Can be picked along with others (⌘-click, ⇧-click).
     var isPickable: Bool {
         switch self {
-        case .bookmark, .tab: true
+        case .bookmark, .tab, .folder: true
         default: false
         }
     }
@@ -411,13 +447,31 @@ final class SidebarListView: NSView {
         insertionLine.wantsLayer = true
         insertionLine.isHidden = true
         addSubview(insertionLine)
+        // A click outside the list lets a picked row's mark go, as Esc does. A drawn menu handles its own closing.
+        outsideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, !self.marked.isEmpty else { return event }
+            if MenuPanel.current != nil { return event }
+            guard event.window === self.window else { self.clearMarks(); return event }
+            let point = self.convert(event.locationInWindow, from: nil)
+            if !self.visibleRect.contains(point) { self.clearMarks() }
+            return event
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    deinit {
+        if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
+    }
+
     // MARK: Model
 
     private var manager: TabManager? { delegate?.tabManager }
+    /// The folders of the space on show: what a picked folder carries.
+    private var foldersOnShow: [BookmarkFolder] {
+        manager.map { Library.shared.folders(in: spaceOverride ?? $0.currentSpaceID) } ?? []
+    }
+
     private func buildItems() -> [SidebarItem] {
         guard let manager else { return [] }
         var result: [SidebarItem] = [.header]
@@ -1097,14 +1151,19 @@ final class SidebarListView: NSView {
             return header
         case .folder(let id):
             let row = FolderRowView()
-            row.onClick = { [weak self] _ in
+            row.onClick = { [weak self] event in
                 guard let self, let open = Library.shared.folder(id)?.isOpen else { return }
+                // ⌘-click and ⇧-click pick the folder with the other rows; a plain click opens or shuts it.
+                if self.mark(item, with: event) { return }
                 // In a folded section, it unfolds the section.
                 if let space = self.shownSpaceID, Self.isCollapsed(space) { self.toggleCollapsed(); return }
                 self.delegate?.listSetFolderOpen(id, !open)
             }
             row.onRename = { [weak self] name in self?.delegate?.listRenameFolder(id, to: name) }
-            row.onRightClick = { [weak self] _ in self?.delegate?.listMenu(for: item) }
+            // Through the same menu path as a tab or pinned page, so a picked folder keeps its mark while its menu
+            // is open and lets it go when the menu closes with no action.
+            row.onRightClick = { [weak self] _ in self?.menu(for: item) }
+            row.onDrawnMenuClose = { [weak self] chose in self?.menuClosed(choseAction: chose) }
             row.onDragStart = { [weak self, weak row] event in
                 guard let self, let row else { return false }
                 return self.beginDrag(item, view: row, event: event)
@@ -1120,7 +1179,9 @@ final class SidebarListView: NSView {
                 self?.delegate?.listSetGroupOpen(id, !open)
             }
             row.onRename = { [weak self] name in self?.delegate?.listRenameGroup(id, to: name) }
-            row.onRightClick = { [weak self] _ in self?.delegate?.listMenu(for: item) }
+            // As a folder: a picked row's menu keeps its mark, and right-clicking away from the pick lets it go.
+            row.onRightClick = { [weak self] _ in self?.menu(for: item) }
+            row.onDrawnMenuClose = { [weak self] chose in self?.menuClosed(choseAction: chose) }
             row.onDragStart = { [weak self, weak row] event in
                 guard let self, let row else { return false }
                 return self.beginDrag(item, view: row, event: event)
@@ -1181,6 +1242,7 @@ final class SidebarListView: NSView {
                 self?.delegate?.listSetNestedTabsCollapsed(tab, !tab.isCollapsed)
             }
             row.onRightClick = { [weak self, weak row] event in self?.menu(for: item, row: row, event: event) }
+            row.onDrawnMenuClose = { [weak self] chose in self?.menuClosed(choseAction: chose) }
             row.onDragStart = { [weak self, weak row] event in
                 guard let self, let row else { return false }
                 return self.beginDrag(item, view: row, event: event)
@@ -1250,6 +1312,7 @@ final class SidebarListView: NSView {
                 if let page = Self.pointer(in: row).flatMap(row.partPage(at:)) { self?.delegate?.listClose(page) }
             }
             row.onRightClick = { [weak self, weak row] event in self?.menu(for: item, row: row, event: event) }
+            row.onDrawnMenuClose = { [weak self] chose in self?.menuClosed(choseAction: chose) }
             row.onDragStart = { [weak self, weak row] event in
                 guard let self, let row else { return false }
                 return self.beginDrag(item, view: row, event: event)
@@ -1311,6 +1374,8 @@ final class SidebarListView: NSView {
             row.configure(name: folder.name, open: folder.isOpen && !folded, count: count, icon: folder.icon,
                           live: folder.live != nil, siteIcon: siteIcon, unread: folder.live == nil ? 0 : LiveFolders.shared.unreadCount(id),
                           updating: folder.live != nil && LiveFolders.shared.isRefreshing(id))
+            // A folder picked with the other rows draws the same mark as a picked tab or page.
+            row.isMarked = marked.contains(item)
             row.setAccessibilityDisclosureLevel(rowDepth[item] ?? 0)
         case .tabGroup(let id):
             guard let row = view as? FolderRowView, let group = manager.group(id) else { return }
@@ -1379,36 +1444,58 @@ final class SidebarListView: NSView {
         let flags = event?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
         guard flags.contains(.command) || flags.contains(.shift) else {
             if !marked.isEmpty { clearMarks() }
+            markAnchor = nil
             return false
         }
-        let pickable = items.filter(\.isPickable)
-        // Starting a pick includes where you are, the way Finder keeps what's already selected.
-        if marked.isEmpty, let current = currentItem, current != item { marked = [current] }
-        let anchor = markAnchor.flatMap { marked.contains($0) ? $0 : nil } ?? marked.last ?? currentItem
-        if flags.contains(.shift), let anchor, let a = pickable.firstIndex(of: anchor), let b = pickable.firstIndex(of: item) {
-            for picked in pickable[min(a, b)...max(a, b)] where !marked.contains(picked) { marked.append(picked) }
+        // ⌘-click picks only the row clicked. ⇧-click with no row picked before it starts from where you are.
+        let remembered = markAnchor.flatMap { items.contains($0) ? $0 : nil }
+        let anchor = remembered ?? (flags.contains(.shift) ? marked.last ?? currentItem : marked.last)
+        let next = Self.markedRows(marked, clicking: item, anchor: anchor, extending: flags.contains(.shift),
+                                   all: items, folders: foldersOnShow)
+        let added = next.contains(item)
+        marked = next
+        if flags.contains(.shift), let anchor {
             markAnchor = anchor
-        } else if let i = marked.firstIndex(of: item) {
-            marked.remove(at: i)
-        } else {
-            marked.append(item)
+        } else if added {
+            // The first ⌘-click is kept as the anchor, so the next one picks with it. Every row shows its mark at once.
             markAnchor = item
+        } else if markAnchor.map({ marked.contains($0) }) != true {
+            markAnchor = marked.last
         }
-        marked.sort { (items.firstIndex(of: $0) ?? 0) < (items.firstIndex(of: $1) ?? 0) }
-        if marked.count < 2 { marked = [] }
         takeFocus()
         refreshRows()
         return true
     }
 
+    /// The selection after one ⌘-click or ⇧-click. ⇧ extends from the anchor through the pickable rows, folders
+    /// included; ⌘ adds or takes away one row. Rows a picked folder carries leave the selection: the folder moves them
+    /// with it, once. The rows stay in the order the list draws them.
+    nonisolated static func markedRows(_ marked: [SidebarItem], clicking item: SidebarItem, anchor: SidebarItem?,
+                                       extending: Bool, all: [SidebarItem], folders: [BookmarkFolder]) -> [SidebarItem] {
+        let pickable = all.filter(\.isPickable)
+        var picked = marked
+        // No row was picked before this one, so the anchor is the first click: it joins the selection now.
+        if picked.isEmpty, let anchor, anchor != item, all.contains(anchor) { picked.append(anchor) }
+        if extending, let anchor, let a = pickable.firstIndex(of: anchor), let b = pickable.firstIndex(of: item) {
+            for row in pickable[min(a, b)...max(a, b)] where !picked.contains(row) { picked.append(row) }
+        } else if let i = picked.firstIndex(of: item) {
+            picked.remove(at: i)
+        } else {
+            picked.append(item)
+        }
+        picked.sort { (all.firstIndex(of: $0) ?? 0) < (all.firstIndex(of: $1) ?? 0) }
+        return PickedRows.normalized(picked, folders: folders)
+    }
+
     /// The rows these pages and pinned pages show as now, picked; the ones not in the list are left out. After a
     /// change to the picked rows, so the next one applies to the same set without picking them again.
-    func mark(pages: [Tab] = [], pins: [UUID] = []) {
+    func mark(pages: [Tab] = [], pins: [UUID] = [], folders: [UUID] = []) {
         let rows = pages.compactMap(rowItem(for:)) + pins.map { SidebarItem.bookmark(Self.rowID($0)) }
+            + folders.map(SidebarItem.folder)
         var picked: [SidebarItem] = []
         for item in rows where items.contains(item) && !picked.contains(item) { picked.append(item) }
         picked.sort { (items.firstIndex(of: $0) ?? 0) < (items.firstIndex(of: $1) ?? 0) }
-        marked = picked.count < 2 ? [] : picked
+        marked = PickedRows.normalized(picked, folders: foldersOnShow)
         if !marked.isEmpty { takeFocus() }
         refreshRows()
     }
@@ -1432,7 +1519,7 @@ final class SidebarListView: NSView {
             if let now, items.contains(now), !picked.contains(now) { picked.append(now) }
         }
         picked.sort { (items.firstIndex(of: $0) ?? 0) < (items.firstIndex(of: $1) ?? 0) }
-        let next = picked.count < 2 ? [] : picked
+        let next = PickedRows.normalized(picked, folders: foldersOnShow)
         if next != marked { marked = next; refreshRows() }
     }
 
@@ -1440,15 +1527,19 @@ final class SidebarListView: NSView {
 
     /// Picking rows gives the list the keyboard, as selecting in Finder does: Esc lets go, ⌫ removes them, ⌘A picks
     /// the rest, ⌘W closes them all. Clicking into the page takes the keys back, and the picked rows wait.
-    override var acceptsFirstResponder: Bool { marked.count > 1 }
+    override var acceptsFirstResponder: Bool { !marked.isEmpty }
     /// Where the keys were before picking started, to hand them back when it ends.
     private weak var focusBeforeMarking: NSResponder?
+    /// A row's drawn menu is open with one mark kept: an action keeps it, a menu closed with no action lets it go.
+    private var markMenuKept = false
+    /// The click monitor that lets a mark go when the click lands outside the list.
+    nonisolated(unsafe) private var outsideClickMonitor: Any?
 
     /// Whether the keys act on the picked rows: there are some, and nothing else has taken the keyboard since.
     var marksHaveFocus: Bool { marked.count > 1 && window?.firstResponder === self }
 
     private func takeFocus() {
-        guard marked.count > 1, let window, window.firstResponder !== self else { return }
+        guard !marked.isEmpty, let window, window.firstResponder !== self else { return }
         focusBeforeMarking = window.firstResponder
         window.makeFirstResponder(self)
     }
@@ -1468,8 +1559,8 @@ final class SidebarListView: NSView {
         if event.keyCode == 53, mods.isEmpty {
             clearMarks()
         } else if Self.isDeleteKey(event.keyCode), mods.isEmpty || mods == .command {
-            // Held down, the rest of the press would reach the page once the rows are gone (#375).
-            guard !event.isARepeat else { return }
+            // The keys act on a picked set: one row is marked to see and to keep through its menu, not to delete.
+            guard marked.count > 1, !event.isARepeat else { return }
             (window as? BrowserWindow)?.holdsBackDeleteRepeats = true
             delegate?.listRemove(marked)
         } else {
@@ -1518,19 +1609,40 @@ final class SidebarListView: NSView {
     }
 
     func clearMarks() {
+        markAnchor = nil
         guard !marked.isEmpty else { return }
         marked = []
         refreshRows()
     }
 
     private func menu(for item: SidebarItem, row: TabRowView? = nil, event: NSEvent? = nil) -> NSMenu? {
+        markMenuKept = false
         if marked.count > 1, marked.contains(item) { return delegate?.listMenu(forMarked: marked) }
-        clearMarks()
+        // A row picked on its own keeps its mark while its menu is open: an action applies to the same row after it,
+        // and a menu closed with no action lets the mark go. A right-click away from the pick lets it go at once.
+        let keepsMark = marked.count == 1 && marked.contains(item)
+        if !keepsMark { clearMarks() }
         // In a row of several pages, the part right-clicked.
-        if let row, let event, row.pages.count > 1 {
-            return delegate?.listMenu(for: item, page: row.page(at: row.convert(event.locationInWindow, from: nil)))
+        let menu: NSMenu? = if let row, let event, row.pages.count > 1 {
+            delegate?.listMenu(for: item, page: row.page(at: row.convert(event.locationInWindow, from: nil)))
+        } else {
+            delegate?.listMenu(for: item)
         }
-        return delegate?.listMenu(for: item)
+        guard let menu else {
+            markMenuKept = false
+            if keepsMark { clearMarks() }
+            return nil
+        }
+        markMenuKept = keepsMark
+        return menu
+    }
+
+    /// A row's drawn menu closed: a mark kept for it stays when an item was chosen, and goes when the menu was
+    /// dismissed. Menus here are Zigzag's own (`MenuPanel`), so the row reports the close rather than AppKit.
+    func menuClosed(choseAction: Bool) {
+        guard markMenuKept else { return }
+        markMenuKept = false
+        if !choseAction { clearMarks() }
     }
 
     /// Refreshes selection, fading and content without changing layout.
@@ -2153,11 +2265,27 @@ final class SidebarListView: NSView {
         if let screenPoint, let window {
             let local = convert(window.convertPoint(fromScreen: screenPoint), from: nil)
             let tabCarried = if case .tab? = carrying { true } else { false }
+            let folderCarried = if case .folder? = carrying { true } else { false }
             if let carrying, (tabCarried || allowsPinned), local.y >= 0, local.y < tabsBoundary {
                 // A tab, a pinned page or a favorite can land among the pinned rows in this window: a gap, or a
-                // folder's row to go inside it. None is in this list's rows yet, so nothing is left out of the order.
-                let pinned = dragSnapshot(carrying: carrying, carried: [])
-                if let drop = pinned.drop(at: local) {
+                // folder's row to go inside it. A window mirroring the row already has it in its list, so it leaves
+                // its own row out exactly as a drag from this window does.
+                var carried: Set<SidebarItem> = []
+                if items.contains(carrying) {
+                    carried.insert(carrying)
+                    switch carrying {
+                    case .folder(let id):
+                        carried.formUnion(Library.shared.allBookmarkIDs(inFolder: id).map { .bookmark(Self.rowID($0)) })
+                        carried.formUnion(Library.shared.subfolderIDs(of: id).map { .folder($0) })
+                    case .bookmark(let id):
+                        carried.formUnion(Library.shared.pinnedSplit(containing: id)?.ids.map { .bookmark($0) } ?? [])
+                    default:
+                        break
+                    }
+                }
+                let pinned = dragSnapshot(carrying: carrying, carried: carried)
+                // A live folder fills itself: nothing from elsewhere lands inside one either.
+                if let drop = pinned.drop(at: local), drop.folder.map({ Library.shared.folder($0)?.live == nil }) ?? true {
                     resolved = drop
                     pinnedSnapshot = pinned
                     landing = (drop.section, drop.index, local.x)
@@ -2165,14 +2293,39 @@ final class SidebarListView: NSView {
             } else if allowsPinned, local.y >= 0, local.y < tabsBoundary {
                 let (section, index) = target(at: local.y, allowsPinned: true, carried: [])
                 landing = (section, index, local.x)
-            } else if local.y >= 0 {
+            } else if local.y >= 0, !folderCarried {
                 // Among the tabs, the tab snapshot is the one answer: its rows and the tab list give the gap, its
-                // level and the index the drop uses.
-                let tabs = tabSnapshot(moving: [], carried: [], kind: .page)
+                // level and the index the drop uses. A folder stays among the pinned rows. A tab this window also
+                // shows leaves its own row out, as a drag from this window does.
+                var tabCarried: Set<SidebarItem> = []
+                var moving: Set<UUID> = []
+                if case .tab(let id) = carrying, items.contains(.tab(id)) {
+                    tabCarried = [.tab(id)]
+                    moving = [id]
+                }
+                let tabs = tabSnapshot(moving: moving, carried: tabCarried, kind: .page)
                 if let drop = tabs.drop(at: local, allowsOnto: false) {
                     resolved = drop
                     snapshot = tabs
                     landing = (.tabs, drop.index, local.x)
+                } else if let carrying, isTabOrPinnedItem(carrying) {
+                    // The space has no tab rows to resolve against. A tab or a pinned page over it still has a place:
+                    // the top of its Pinned. That keeps a picked pinned set a pinned set in the empty space.
+                    var pinnedCarried: Set<SidebarItem> = []
+                    if items.contains(carrying) {
+                        pinnedCarried.insert(carrying)
+                        if case .folder(let id) = carrying {
+                            pinnedCarried.formUnion(Library.shared.allBookmarkIDs(inFolder: id).map { .bookmark(Self.rowID($0)) })
+                            pinnedCarried.formUnion(Library.shared.subfolderIDs(of: id).map { .folder($0) })
+                        }
+                    }
+                    let pinned = dragSnapshot(carrying: carrying, carried: pinnedCarried)
+                    if let drop = pinned.drop(at: NSPoint(x: local.x, y: -1)),
+                       drop.folder.map({ Library.shared.folder($0)?.live == nil }) ?? true {
+                        resolved = drop
+                        pinnedSnapshot = pinned
+                        landing = (.bookmarks, drop.index, local.x)
+                    }
                 } else {
                     // No tab row to resolve against: fall back to the row count, which puts the line under New Tab.
                     let (section, index) = target(at: local.y, allowsPinned: false, carried: [])
@@ -2188,6 +2341,14 @@ final class SidebarListView: NSView {
         externalPinnedSnapshot = pinnedSnapshot
         placeLine()
         return resolved
+    }
+
+    /// Whether a row carried from elsewhere is a pinned row or a tab: both have a place in an empty space.
+    private func isTabOrPinnedItem(_ item: SidebarItem) -> Bool {
+        switch item {
+        case .bookmark, .folder, .tab: true
+        default: false
+        }
     }
 
     /// Where something from outside the list lands, at a point on screen, and the folder it goes into, if any.
@@ -2241,9 +2402,18 @@ final class SidebarListView: NSView {
         (view as? SidebarRowView)?.isLifted = true
         let picture = CarriedCopy.picture(of: view)
         (view as? SidebarRowView)?.isLifted = false
+        let stack: CarriedCopy.Stack? = together.count > 1
+            ? CarriedCopy.Stack(total: together.count,
+                                folders: together.filter { if case .folder = $0 { true } else { false } }.count,
+                                tabs: together.filter { if case .tab = $0 { true } else { false } }.count
+                                    + together.filter { if case .bookmark = $0 { true } else { false } }.count)
+            : nil
         let copy = CarriedCopy(of: view, picture: picture, grabbedAt: window.convertPoint(toScreen: event.locationInWindow),
-                               ground: Tokens.Color.panelBackground, radius: Tokens.Sidebar.rowRadius)
+                               ground: Tokens.Color.panelBackground, radius: Tokens.Sidebar.rowRadius, stack: stack)
         // Built once for the whole drag. The carried rows are still in it, faint in their places.
+        #if DEBUG
+        zzDragLog("begin item=\(item) marked=\(marked.count) picked=\(picked.count) together=\(together.count) carried=\(carried.count)")
+        #endif
         let snapshot = dragSnapshot(carrying: item, carried: carried)
         let tabs = tabSnapshot(carrying: item, carried: carried)
         drag = DragState(item: item, view: view, copy: copy, together: together, carried: carried, faint: faint,
@@ -2376,9 +2546,9 @@ final class SidebarListView: NSView {
         return nil
     }
 
+    private let insertionLine = InsertionLineView()
     /// The line is on show: the next one that shows after this fades in again.
     private var lineShown = false
-    private let insertionLine = InsertionLineView()
 
     /// Whether the row being carried is in the list on show: in its own space it stays there, faint; carried to
     /// another space, it isn't there at all.
@@ -2639,6 +2809,28 @@ final class SidebarListView: NSView {
         return "section=\(section) index=\(drop.index) folder=\(drop.folder?.uuidString ?? "nil") level=\(level) y=\(y)"
     }
 
+    /// The external line's own state, for a script: the drop another window's row resolved, and the line it drew or why
+    /// it is hidden.
+    func debugExternalState() -> String {
+        var out: [String] = []
+        out.append("external=\(external.map { "\($0.section == .bookmarks ? "bookmarks" : "tabs")/\($0.index)" } ?? "none")")
+        if let drop = externalDrop {
+            out.append("section=\(drop.section == .bookmarks ? "bookmarks" : "tabs") index=\(drop.index) folder=\(drop.folder?.uuidString ?? "nil")")
+            switch drop.place {
+            case .gap(let above, let below, let depth):
+                out.append("place=gap above=\(above.map { String(describing: $0) } ?? "nil") below=\(below.map { String(describing: $0) } ?? "nil") depth=\(depth)")
+            case .onto(let item):
+                out.append("place=onto \(item)")
+            }
+            let line = externalPinnedSnapshot?.line(for: drop, rowGap: rowGap) ?? externalSnapshot?.line(for: drop, rowGap: rowGap)
+            out.append("line=\(line.map { "\($0.y)/\($0.depth)" } ?? "none")")
+        } else {
+            out.append("drop=none")
+        }
+        out.append("hidden=\(insertionLine.isHidden) frame=\(NSStringFromRect(insertionLine.frame))")
+        return out.joined(separator: " ")
+    }
+
     #endif
 
     private weak var externalTarget: SidebarListView?
@@ -2709,13 +2901,14 @@ final class SidebarListView: NSView {
         let hit = Self.list(at: mouse)
         let inWindow = Self.window(at: mouse) === window.windowController
 
-        // Another window's list shows where a tab would land there; a pinned page can land among its pinned tabs too.
-        // Over its favorites grid, it takes the drop as a favorite there. Only where it would be taken: neither window
-        // private, as the drop itself asks.
-        if let (controller, list) = hit, list !== self, drag.item.canBeFavorite,
+        // Another window's list shows where the row would land there: a tab, a pinned page, a favorite or a folder,
+        // among its pinned rows or its tabs. Over its favorites grid, a page or tab is taken as a favorite there. Only
+        // where it would be taken: neither window private, as the drop itself asks.
+        let folderCarried = if case .folder = drag.item { true } else { false }
+        if let (controller, list) = hit, list !== self, drag.item.canBeFavorite || folderCarried,
            manager?.isPrivate == false, !controller.tabManager.isPrivate {
             let targetPoint = controller.window?.convertPoint(fromScreen: mouse) ?? .zero
-            let overTargetFavorites = !list.isPointInPinnedSection(targetPoint)
+            let overTargetFavorites = drag.item.canBeFavorite && !list.isPointInPinnedSection(targetPoint)
                 && controller.listDragOverFavorites(at: targetPoint, carrying: splitSide(of: drag.item))
             if overTargetFavorites {
                 externalTarget?.externalHover(at: nil)
@@ -2732,7 +2925,8 @@ final class SidebarListView: NSView {
                 self.drag?.externalFavorite = nil
                 if externalTarget !== list { externalTarget?.externalHover(at: nil) }
                 externalTarget = list
-                let target = list.externalHover(at: mouse, allowsPinned: drag.item.canBeFavorite, carrying: drag.item)
+                let target = list.externalHover(at: mouse, allowsPinned: drag.item.canBeFavorite || folderCarried,
+                                                carrying: drag.item)
                 drag.externalDrop = target
                 self.drag?.externalDrop = target
             }
@@ -2996,6 +3190,23 @@ final class SidebarListView: NSView {
         let groupTabs = groupID.map(manager.tabs(inGroup:)) ?? []
         let tab: Tab? = { if case .tab(let id) = drag.item { manager.tab(with: id) } else { nil } }() ?? groupTabs.first
 
+        // A picked set of pinned rows let go over another window whose space is empty: the whole set moves to that
+        // space's Pinned. An empty space has no row for the line to resolve, so the hover can leave no target at all.
+        // This reads the release point directly, before any row offer can take the drop.
+        let pickedForWindow = marked.count > 1 && marked.contains(drag.item) ? marked : drag.together
+        let pinnedOnlyForWindow = pickedForWindow.allSatisfy { if case .tab = $0 { false } else { true } }
+        if pinnedOnlyForWindow, pickedForWindow.count > 1,
+           let (controller, list) = Self.list(at: mouse), list !== self,
+           controller.tabManager !== manager,
+           let source = window?.windowController as? BrowserWindowController,
+           Library.shared.bookmarks(in: controller.tabManager.currentSpaceID).isEmpty,
+           Library.shared.folders(in: controller.tabManager.currentSpaceID).isEmpty {
+            #if DEBUG
+            zzDragLog("early pinnedset items=\(pickedForWindow.count) target=\(controller.tabManager.currentSpaceID)")
+            #endif
+            return controller.listMovePinnedSetToWindow(pickedForWindow, from: source)
+        }
+
         // Onto the middle of a tab's or pinned page's row: the two open side by side. The pair takes the kind of the
         // row it was dropped on, so it shows once: on a pinned page, a pinned split; on a tab, a split among tabs.
         if let split = drag.splitTarget {
@@ -3046,14 +3257,35 @@ final class SidebarListView: NSView {
         let tabs = groupID != nil ? groupTabs : drag.together.compactMap { item -> Tab? in if case .tab(let id) = item { manager.tab(with: id) } else { nil } }
 
         // Into another window's sidebar, where its line showed: the target that line came from, not a second reading
-        // of the release point. A tab that drifted a point at the end still lands where the line said.
-        if let tab, let externalList = external, let target = drag.externalDrop,
+        // of the release point. A row that drifted a point at the end still lands where the line said. The marks are
+        // read again here: a drag that began before the last ⌘-click still carries the whole picked set.
+        let picked = marked.count > 1 && marked.contains(drag.item) ? marked : drag.together
+        #if DEBUG
+        zzDragLog("drop item=\(drag.item) marked=\(marked.count) together=\(drag.together.count) picked=\(picked.count) section=\(drag.targetSection.map(String.init(describing:)) ?? "nil")")
+        #endif
+        let folderItem = if case .folder = drag.item { true } else { false }
+        if let externalList = external, let target = drag.externalDrop,
            let controller = externalList.window?.windowController as? BrowserWindowController,
-           controller.tabManager !== manager {
-            if target.section == .bookmarks, let source = window?.windowController as? BrowserWindowController {
+           controller.tabManager !== manager,
+           let source = window?.windowController as? BrowserWindowController {
+            if target.section == .bookmarks, picked.count > 1 || folderItem {
+                // A picked set or a folder: every row lands in the one place the line showed, one change.
+                return controller.listMovePickedToWindow(picked, around: drag.item, to: target, from: source)
+            }
+            if target.section == .tabs, picked.count > 1 {
+                // Several picked pinned rows into this window's space: they stay pinned rows, at the top of its Pinned
+                // section, so every one moves and lands where it can be seen. A selection with tabs in it keeps the
+                // tabs section's own move.
+                let pinnedOnly = picked.allSatisfy { if case .tab = $0 { false } else { true } }
+                if pinnedOnly {
+                    return controller.listMovePinnedSetToWindow(picked, from: source)
+                }
+                return controller.listMovePickedToWindow(picked, around: drag.item, to: target, from: source)
+            }
+            if target.section == .bookmarks, let tab {
                 return controller.listPinTabToWindow(tab, from: source, at: target)
             }
-            if target.section == .tabs,
+            if target.section == .tabs, let tab,
                delegate?.listMoveToWindow(tabs, controller: controller, index: target.index) == true {
                 return externalList.row(for: tab)
             }
@@ -3063,6 +3295,19 @@ final class SidebarListView: NSView {
            controller.tabManager !== manager,
            delegate?.listMoveToWindow(tabs, controller: controller, index: list.dropIndex(at: mouse)) == true {
             return list.row(for: tab)
+        }
+        // A picked set of pinned rows over another window whose space has nothing for the line to resolve: the whole
+        // set still has a place, this space's Pinned. It moves there even when the hover produced no drop.
+        let pinnedOnly = picked.allSatisfy { if case .tab = $0 { false } else { true } }
+        #if DEBUG
+        zzDragLog("fallback ext=\(external != nil) hit=\(Self.list(at: mouse) != nil) dropNil=\(drag.externalDrop == nil) picked=\(picked.count) pinnedOnly=\(pinnedOnly)")
+        #endif
+        if drag.externalDrop == nil, picked.count > 1, pinnedOnly,
+           let externalList = external ?? Self.list(at: mouse)?.1,
+           let controller = externalList.window?.windowController as? BrowserWindowController,
+           controller.tabManager !== manager,
+           let source = window?.windowController as? BrowserWindowController {
+            return controller.listMovePinnedSetToWindow(picked, from: source)
         }
         if case .bookmark(let id) = drag.item, let externalList = external,
            let (controller, list) = Self.list(at: mouse), list === externalList, controller.tabManager !== manager,
@@ -3074,20 +3319,29 @@ final class SidebarListView: NSView {
         // become a new window there.
         if tab != nil, Self.window(at: mouse) !== window?.windowController, delegate?.listDropOutside(tabs, at: mouse) == true { return nil }
 
-        // Onto a space's dot: into that space, whichever one is showing.
+        // Onto a space's dot: into that space, whichever one is showing. Several picked rows are one change.
         if let space = drag.hoverSpace {
-            for item in drag.together {
-                switch item {
-                case .tab(let id):
-                    if let tab = manager.tab(with: id), tab.spaceID != space { delegate?.listMove(tab, to: drag.together.count == 1 ? 0 : Int.max, in: space) }
-                case .bookmark(let id):
-                    if Library.shared.spaceID(ofBookmark: id) != space { delegate?.listMoveBookmark(id, to: Int.max, in: space) }
-                case .folder(let id):
-                    if !Library.shared.folders(in: space).contains(where: { $0.id == id }) { delegate?.listMoveFolder(id, to: Int.max, in: space, parent: nil) }
-                case .tabGroup(let id):
-                    if groupTabs.first?.spaceID != space { delegate?.listMoveGroup(id, to: Int.max, in: space) }
-                default: break
+            let items = picked
+            let move = { [weak self] in
+                guard let self, let manager = self.manager else { return }
+                for item in items {
+                    switch item {
+                    case .tab(let id):
+                        if let tab = manager.tab(with: id), tab.spaceID != space { self.delegate?.listMove(tab, to: items.count == 1 ? 0 : Int.max, in: space) }
+                    case .bookmark(let id):
+                        if Library.shared.spaceID(ofBookmark: id) != space { self.delegate?.listMoveBookmark(id, to: Int.max, in: space) }
+                    case .folder(let id):
+                        if !Library.shared.folders(in: space).contains(where: { $0.id == id }) { self.delegate?.listMoveFolder(id, to: Int.max, in: space, parent: nil) }
+                    case .tabGroup(let id):
+                        if groupTabs.first?.spaceID != space { self.delegate?.listMoveGroup(id, to: Int.max, in: space) }
+                    default: break
+                    }
                 }
+            }
+            if items.count > 1 {
+                delegate?.listMovePickedToSpace(items, spaceID: space)
+            } else {
+                move()
             }
             return nil
         }
@@ -3102,6 +3356,19 @@ final class SidebarListView: NSView {
         // Nowhere new: back to its row, if that's on show. (Asked of this drag: the list's own has ended by now.)
         guard let section = drag.targetSection, section == .tabs || pinned != nil else {
             return shownSpaceID == drag.originSpace ? drag.view : nil
+        }
+        // Several picked rows onto the pinned side: the primary row lands where the line showed, then the rest of the
+        // selection around it, all in one change. A single row keeps its own path below.
+        if section == .bookmarks, let pinned, drag.together.count > 1 {
+            delegate?.listMovePicked(drag.together, around: drag.item, to: pinned, in: space)
+            switch drag.item {
+            case .bookmark(let id): return row(forBookmark: id) ?? rows[.bookmark(id)]
+            case .folder(let id): return rows[.folder(id)]
+            case .tab(let id):
+                guard let bookmarkID = manager.tab(with: id)?.bookmarkID else { return nil }
+                return row(forBookmark: bookmarkID)
+            default: return nil
+            }
         }
         var landing: NSView?
         // Among the tabs, the drop's place in the tab list (the dragged tab taken out first), with the parent tab among
