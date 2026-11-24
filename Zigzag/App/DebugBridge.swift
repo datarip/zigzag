@@ -1584,6 +1584,26 @@ enum DebugBridge {
             } else {
                 debugLog("rowdrop \(arg) offered=\(controller.sidebar.list.debugOfferSplit(carried, onto: target, onRight: f.count == 3 && f[2] == "right"))")
             }
+        case "droptarget":
+            // droptarget x y <folder, pinned page or tab>: where a drop of that row would land, for a pointer at that
+            // point (window points, top left), without a mouse. Logs the section, index, folder, level and line y.
+            let f = arg.split(separator: " ", maxSplits: 2).map(String.init)
+            guard f.count == 3, let x = Double(f[0]), let y = Double(f[1]), let window = controller.window else {
+                debugLog("droptarget \(arg): need x y and a folder, pinned page or tab")
+                break
+            }
+            let space = controller.tabManager.currentSpaceID
+            let name = f[2]
+            let carried: SidebarItem? = Library.shared.folders(in: space).first { $0.name == name }.map { .folder($0.id) }
+                ?? Library.shared.bookmarks(in: space).first { $0.title == name }.map { .bookmark(SidebarListView.rowID($0.id)) }
+                ?? controller.tabManager.tabs(in: space).first { $0.displayTitle.contains(name) }.map { .tab($0.id) }
+            guard let carried else {
+                debugLog("droptarget \(arg): no folder, pinned page or tab named \(name)")
+                break
+            }
+            let list = controller.sidebar.list
+            let point = list.convert(NSPoint(x: x, y: window.frame.height - y), from: nil)
+            debugLog("droptarget \(arg) => \(list.debugDrop(at: point, carrying: carried))")
         case "rowhover":
             // rowhover <n>: the row of the tab at this place in the list as if the pointer were over it; off: none.
             let tabs = controller.tabManager.currentTabs
@@ -3737,19 +3757,19 @@ enum DebugBridge {
     /// about 150 folders, up to eight deep, one of them holding 400 pages of its own, all shut but the outermost. Only into a test copy's own data.
     static func seedFolders(_ count: Int, in controller: BrowserWindowController) {
         guard ProcessInfo.processInfo.environment["ZIGZAG_DATA_DIR"] != nil else { debugLog("seedfolders refused: not a test copy"); return }
-        let names = ["Spring", "Boot", "Config", "Profiles", "Notes", "Guides", "Docs", "Tools", "Archive", "Old", "设计", "学习"]
+        let names = ["Spring", "Boot", "Config", "Profiles", "Notes", "Guides", "Docs", "Tools", "Archive", "Old", "Design", "Study"]
         var paths: [[String]] = []
         func grow(_ path: [String], branches: Int) {
             paths.append(path)
             guard path.count < 8 else { return }
             for b in 0..<branches { grow(path + [names[(path.count + b) % names.count] + (b == 0 ? "" : " \(b + 1)")], branches: path.count < 2 ? 2 : 1) }
         }
-        let root = "资料文档"
-        for top in ["Java", "Web", "正则表达式"] { grow([root, top], branches: 2) }
-        paths += [[root, "Linux"], [root, "Linux", "Docker"], [root, "Linux", "vpn"], [root, "镜像"]]
-        for i in 1...10 { grow(["收藏 \(i)"], branches: 2) }
+        let root = "Library"
+        for top in ["Java", "Web", "Regex"] { grow([root, top], branches: 2) }
+        paths += [[root, "Linux"], [root, "Linux", "Docker"], [root, "Linux", "vpn"], [root, "Images"]]
+        for i in 1...10 { grow(["Saved \(i)"], branches: 2) }
         // The big one: a folder of 400 pages, opened and shut while timing.
-        let big = [root, "镜像"]
+        let big = [root, "Images"]
         let hosts = (0..<300).map { "site\($0)." + ($0 % 2 == 0 ? "com" : "test") }
         let icon = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in
             NSColor.systemTeal.setFill(); NSBezierPath(ovalIn: rect).fill(); return true

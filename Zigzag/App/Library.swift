@@ -1179,7 +1179,7 @@ final class Library {
         guard let bookmark = bookmark(bookmarkID), !isFavorite(bookmarkID) else { return }
         if let pinned = pinnedSplit(containing: bookmarkID), case let marks = pinned.ids.compactMap(self.bookmark), marks.count == pinned.ids.count {
             for s in spaces.indices {
-                spaces[s].bookmarks.removeAll { pinned.contains($0.id) }
+                removePages(pinned.ids, at: s)
                 spaces[s].pinnedSplits?.removeAll { $0.contains(bookmarkID) }
                 if spaces[s].pinnedSplits?.isEmpty == true { spaces[s].pinnedSplits = nil }
                 tidyFolders(s)
@@ -1190,7 +1190,7 @@ final class Library {
             commit()
             return
         }
-        for s in spaces.indices { spaces[s].bookmarks.removeAll { $0.id == bookmarkID }; tidyFolders(s) }
+        for s in spaces.indices { removePages([bookmarkID], at: s); tidyFolders(s) }
         arrangeFavorites(Self.placing([bookmarkID], atSlot: slot, in: favorites(in: profile).map(\.id), splits: favoriteSplits), adding: [bookmark], in: profile)
         commit()
     }
@@ -1206,7 +1206,7 @@ final class Library {
         favorites.removeAll { ids.contains($0.id) }
         favoriteSplits.removeAll { $0.contains(id) }
         for id in ids { directory.assign(favorite: id, to: Profile.defaultID) }
-        spaces[s].bookmarks.insert(contentsOf: moving, at: min(max(index, 0), spaces[s].bookmarks.count))
+        insertPages(moving, at: s, at: index)
         if let pair { spaces[s].pinnedSplits = (spaces[s].pinnedSplits ?? []) + [pair] }
         tidyFolders(s)
         commit()
@@ -1215,7 +1215,7 @@ final class Library {
     /// Takes a pinned page out of its space, to become a favorite; the caller commits.
     func detachBookmark(_ id: UUID) -> Bookmark? {
         guard let bookmark = spaces.lazy.compactMap({ $0.bookmarks.first { $0.id == id } }).first else { return nil }
-        for s in spaces.indices { spaces[s].bookmarks.removeAll { $0.id == id }; tidyFolders(s) }
+        for s in spaces.indices { removePages([id], at: s); tidyFolders(s) }
         return bookmark
     }
 
@@ -1273,7 +1273,7 @@ final class Library {
         guard let s = self.index(of: spaceID) else { return nil }
         let bookmark = Bookmark(id: id, url: url, title: title, icon: icon)
         let at = Self.place(index, among: spaces[s].bookmarks.count)
-        spaces[s].bookmarks.insert(bookmark, at: at)
+        insertPages([bookmark], at: s, at: at)
         // Landing between a folder's pages doesn't put it in the folder: it goes just after, where the sidebar shows it.
         tidyFolders(s)
         commit()
@@ -1341,7 +1341,7 @@ final class Library {
     func removeBookmarks(_ ids: [UUID]) {
         favorites.removeAll { ids.contains($0.id) }
         tidyFavorites()
-        for s in spaces.indices { spaces[s].bookmarks.removeAll { ids.contains($0.id) }; tidyFolders(s) }
+        for s in spaces.indices { removePages(ids, at: s); tidyFolders(s) }
         commit()
     }
 
@@ -1383,15 +1383,103 @@ final class Library {
 
     /// Moves a pinned page to a place in a space's list. `folder`: the folder it lands in (nil: none); when left
     /// out, it keeps the folder it's in if it stays in the same space. Half of a pinned split moves the pair.
+    /// A folder's place is on the pages' number line, so pages moving in the flat list must carry the places with them:
+    /// otherwise a folder slides between the row the line showed and the page it was dropped on. `atOrAbove` for a page
+    /// put in, `above` for one taken out.
+    private func shiftFolderRanks(in s: Int, atOrAbove index: Int, by delta: Double) {
+        guard delta != 0, var folders = spaces[s].folders else { return }
+        for f in folders.indices {
+            if let rank = folders[f].rank, rank >= Double(index) { folders[f].rank = rank + delta }
+        }
+        spaces[s].folders = folders
+    }
+
+    private func shiftFolderRanks(in s: Int, above index: Int, by delta: Double) {
+        guard delta != 0, var folders = spaces[s].folders else { return }
+        for f in folders.indices {
+            if let rank = folders[f].rank, rank > Double(index) { folders[f].rank = rank + delta }
+        }
+        spaces[s].folders = folders
+    }
+
+    /// Takes pages out of a space's flat list and moves the folders after them by the same amount.
+    private func removePages(_ ids: [UUID], at s: Int) {
+        let places = ids.compactMap { id in spaces[s].bookmarks.firstIndex { $0.id == id } }
+        spaces[s].bookmarks.removeAll { ids.contains($0.id) }
+        for place in places.sorted(by: >) { shiftFolderRanks(in: s, above: place, by: -1) }
+    }
+
+    /// Puts pages into a space's flat list and moves the folders after them by the same amount.
+    private func insertPages(_ pages: [Bookmark], at s: Int, at index: Int) {
+        let place = max(0, min(index, spaces[s].bookmarks.count))
+        spaces[s].bookmarks.insert(contentsOf: pages, at: place)
+        shiftFolderRanks(in: s, atOrAbove: place, by: Double(pages.count))
+    }
+
+    /// A folder whose stored place is before a newly inserted page, while its first page comes after it, would draw
+    /// its whole block before that page and swallow it. Move its place past the inserted pages, unless the page went
+    /// into that folder or one of its own.
+    private func shiftStraddlingFolders(in s: Int, at index: Int, count: Int, destination: UUID?, parent: UUID?) {
+        guard count > 0, var folders = spaces[s].folders, !folders.isEmpty else { return }
+        let byID = Dictionary(folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var folderOf: [UUID: UUID] = [:]
+        for folder in folders { for id in folder.bookmarkIDs { folderOf[id] = folder.id } }
+        var first: [UUID: Int] = [:]
+        for (i, bookmark) in spaces[s].bookmarks.enumerated() {
+            var next = folderOf[bookmark.id], seen: Set<UUID> = []
+            while let id = next, seen.insert(id).inserted {
+                if first[id] == nil { first[id] = i }
+                next = byID[id]?.parentID
+            }
+        }
+        var insideDestination: Set<UUID> = []
+        var next = destination
+        while let id = next, insideDestination.insert(id).inserted { next = byID[id]?.parentID }
+        let after = index + count
+        var moving: [(folder: Int, first: Int)] = []
+        for f in folders.indices {
+            let folder = folders[f]
+            guard folder.parentID == parent, !insideDestination.contains(folder.id), let rank = folder.rank,
+                  let firstPage = first[folder.id], firstPage >= after else { continue }
+            let straddles = count > 1 ? rank < Double(index) || rank <= Double(index + count - 1) : rank < Double(index)
+            guard straddles else { continue }
+            moving.append((f, firstPage))
+        }
+        // Every folder whose block started before the inserted row now starts after it, in its old order. A negative
+        // place stays below the pages at the old line, so adding the count is not enough: the row goes after the pages.
+        moving.sort { $0.first < $1.first }
+        let base = Double(index + count) - 0.5
+        for (order, entry) in moving.enumerated() {
+            let rank = base + Double(order + 1) * 0.01
+            folders[entry.folder].rank = rank
+        }
+        if !moving.isEmpty { spaces[s].folders = folders }
+    }
+
+    /// A pinned page moved to a place in a space's list, one change. The drag's drops go through `movePinned` instead:
+    /// that one carries the whole place, this one takes an index and works the place out.
     func moveBookmark(_ id: UUID, to index: Int, in spaceID: UUID, folder: UUID?? = .none) {
         guard bookmark(id) != nil, let target = self.index(of: spaceID) else { return }
         let from = self.spaceID(ofBookmark: id)
         let pinned = pinnedSplit(containing: id)
         let ids = pinned.map(\.ids) ?? [id]
+        let currentFolder = folderID(containing: id)
+        let targetFolder: UUID? = switch folder { case .some(let chosen): chosen; case .none: currentFolder }
+        // The row is already at that place and folder: leave every folder place exactly as it is. Removing and putting
+        // it back at the same index moved empty folders behind it, because their ranks crossed zero between the two.
+        if from == spaceID, let actual = spaces[target].bookmarks.firstIndex(where: { $0.id == id }),
+           actual == index, targetFolder == currentFolder {
+            return
+        }
         let moving = ids.compactMap(bookmark)
-        for s in spaces.indices { spaces[s].bookmarks.removeAll { ids.contains($0.id) } }
+        if let source = from.flatMap({ self.index(of: $0) }) {
+            removePages(ids, at: source)
+            for s in spaces.indices where s != source { spaces[s].bookmarks.removeAll { ids.contains($0.id) } }
+        } else {
+            for s in spaces.indices { spaces[s].bookmarks.removeAll { ids.contains($0.id) } }
+        }
         let at = max(0, min(index, spaces[target].bookmarks.count))
-        spaces[target].bookmarks.insert(contentsOf: moving, at: at)
+        insertPages(moving, at: target, at: at)
         let keep: UUID? = from == spaceID ? folderID(containing: id) : nil
         let chosen: UUID? = switch folder { case .some(let chosen): chosen; case .none: keep }
         let landsIn = outsideLive(chosen)
@@ -1402,6 +1490,7 @@ final class Library {
             // In the folder at the place it was dropped, by the list's order.
             spaces[target].folders?[f].bookmarkIDs.append(contentsOf: ids)
         }
+        shiftStraddlingFolders(in: target, at: at, count: ids.count, destination: landsIn, parent: landsIn)
         // Into another space, the pair stays a pair there.
         if let pinned, let from, let s = self.index(of: from), s != target {
             spaces[s].pinnedSplits?.removeAll { $0 == pinned }
@@ -1410,6 +1499,24 @@ final class Library {
         tidyFolders(target, keepingPlaceOf: id)
         if let from, let s = self.index(of: from), s != target { tidyFolders(s) }
         commit()
+    }
+
+    /// A pinned page or folder dropped where the drag resolved: the place transaction works out the pages' order and
+    /// every folder's place from the one line, and applies them all at once. Returns false when the drop leaves the tree
+    /// as it was, which is the one case that records nothing.
+    @discardableResult
+    func movePinned(_ item: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) -> Bool {
+        guard let s = index(of: spaceID) else { return false }
+        let place = PinnedPlace(pages: spaces[s].bookmarks.map(\.id), folders: spaces[s].folders ?? [],
+                                splits: spaces[s].pinnedSplits ?? [])
+        guard let moved = place.moved(item, to: drop) else { return false }
+        let byID = Dictionary(spaces[s].bookmarks.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let pages = moved.pages.compactMap { byID[$0] }
+        guard pages.count == spaces[s].bookmarks.count else { return false }
+        spaces[s].bookmarks = pages
+        spaces[s].folders = moved.folders.isEmpty ? nil : moved.folders
+        commit()
+        return true
     }
 
     // MARK: Folders
@@ -1545,8 +1652,12 @@ final class Library {
     /// Moves a folder, with everything inside it, to a place in a space's list, counted in pinned pages without its
     /// own. `parent`: the folder it goes into (nil: the top level); left out, it stays in the one it's in when it stays
     /// in its space. At the top level it never lands between another folder's pages or a pinned split's two; its own
-    /// pinned splits go along.
+    /// pinned splits go along. A drag's drop goes through `movePinned` instead, which carries its own place.
     func moveFolder(_ id: UUID, to index: Int, in spaceID: UUID, parent: UUID?? = .none) {
+        placeFolder(id, at: index, in: spaceID, parent: parent, snapping: true)
+    }
+
+    private func placeFolder(_ id: UUID, at index: Int, in spaceID: UUID, parent: UUID??, snapping: Bool) {
         guard let s = spaceIndex(ofFolder: id), let target = self.index(of: spaceID),
               let f = spaces[s].folders?.firstIndex(where: { $0.id == id }), var folder = spaces[s].folders?[f] else { return }
         let inner = (spaces[s].folders ?? []).descendants(of: id)
@@ -1555,7 +1666,7 @@ final class Library {
         var into = outsideLive(chosen)
         if let p = into, p == id || inner.contains(p) || spaces[target].folders?.contains(where: { $0.id == p }) != true { into = folder.parentID.flatMap { s == target ? $0 : nil } }
         // Into a folder with no place given: at the end of that folder's pages, or where it sits if it has none.
-        var at = into == nil ? folderDropIndex(index, moving: id, in: spaceID) : index
+        var at = into == nil && snapping ? folderDropIndex(index, moving: id, in: spaceID) : index
         if let p = into, index == Int.max {
             let members = (spaces[target].folders ?? []).pages(in: id)
             let others = spaces[target].bookmarks.filter { !members.contains($0.id) }
@@ -1569,8 +1680,8 @@ final class Library {
         }
         let members = (spaces[s].folders ?? []).pages(in: id)
         let moving = spaces[s].bookmarks.filter { members.contains($0.id) }
-        spaces[s].bookmarks.removeAll { members.contains($0.id) }
-        spaces[target].bookmarks.insert(contentsOf: moving, at: max(0, min(at, spaces[target].bookmarks.count)))
+        removePages(Array(members), at: s)
+        insertPages(moving, at: target, at: at)
         folder.parentID = into
         spaces[s].folders?[f] = folder
         if let p = into, let pi = spaces[target].folders?.firstIndex(where: { $0.id == p }) { spaces[target].folders?[pi].isOpen = true; spaces[target].folders?[pi].tucked = nil }
@@ -1631,14 +1742,14 @@ final class Library {
             // pins, or at the start of its parent folder's pages.
             if (spaces[s].folders ?? []).pages(in: folderID).isEmpty, let from = spaces[s].bookmarks.firstIndex(where: { $0.id == bookmarkID }) {
                 let page = spaces[s].bookmarks.remove(at: from)
-                spaces[s].bookmarks.insert(page, at: insertionIndex(intoEmptyFolder: folderID, space: s))
+                insertPages([page], at: s, at: insertionIndex(intoEmptyFolder: folderID, space: s))
             }
             // To the end of the folder: after its last page in the list.
             spaces[s].folders?[f].bookmarkIDs.append(bookmarkID)
             if let last = spaces[s].folders?[f].bookmarkIDs.dropLast().compactMap({ id in spaces[s].bookmarks.firstIndex { $0.id == id } }).max(),
                let from = spaces[s].bookmarks.firstIndex(where: { $0.id == bookmarkID }) {
                 let bookmark = spaces[s].bookmarks.remove(at: from)
-                spaces[s].bookmarks.insert(bookmark, at: min(from < last ? last : last + 1, spaces[s].bookmarks.count))
+                insertPages([bookmark], at: s, at: min(from < last ? last : last + 1, spaces[s].bookmarks.count))
             }
         }
         tidyFolders(s)
@@ -1891,7 +2002,7 @@ final class Library {
     func addPinnedSplit(_ marks: [Bookmark], as layout: PinnedSplit, to spaceID: UUID, at index: Int? = nil) {
         guard let s = self.index(of: spaceID), marks.map(\.id) == layout.ids else { return }
         let at = Self.place(index, among: spaces[s].bookmarks.count)
-        spaces[s].bookmarks.insert(contentsOf: marks, at: at)
+        insertPages(marks, at: s, at: at)
         spaces[s].pinnedSplits = (spaces[s].pinnedSplits ?? []) + [layout]
         tidyFolders(s)
         commit()
@@ -1909,7 +2020,7 @@ final class Library {
     func addPinnedGroup(_ marks: [Bookmark], splits: [PinnedSplit] = [], named name: String, group: UUID, isOpen: Bool, to spaceID: UUID, at index: Int? = nil) {
         guard let s = self.index(of: spaceID), !marks.isEmpty else { return }
         let at = Self.place(index, among: spaces[s].bookmarks.count)
-        spaces[s].bookmarks.insert(contentsOf: marks, at: at)
+        insertPages(marks, at: s, at: at)
         var folder = BookmarkFolder(name: name, bookmarkIDs: marks.map(\.id))
         folder.groupID = group
         folder.isOpen = isOpen
@@ -1925,7 +2036,7 @@ final class Library {
     func joinPinned(_ id: UUID, beside pinnedID: UUID, onRight: Bool) {
         guard let s = spaces.firstIndex(where: { $0.bookmarks.contains { $0.id == pinnedID } }),
               let page = spaces[s].bookmarks.first(where: { $0.id == id }) else { return }
-        spaces[s].bookmarks.removeAll { $0.id == id }
+        removePages([id], at: s)
         for f in (spaces[s].folders ?? []).indices { spaces[s].folders?[f].bookmarkIDs.removeAll { $0 == id } }
         pinBeside(page, pinnedID, onRight: onRight)
     }
@@ -1934,7 +2045,7 @@ final class Library {
     func pinBeside(_ page: Bookmark, _ pinnedID: UUID, onRight: Bool) {
         guard let s = spaces.firstIndex(where: { $0.bookmarks.contains { $0.id == pinnedID } }),
               let at = spaces[s].bookmarks.firstIndex(where: { $0.id == pinnedID }) else { return }
-        spaces[s].bookmarks.insert(page, at: onRight ? at + 1 : at)
+        insertPages([page], at: s, at: onRight ? at + 1 : at)
         spaces[s].pinnedSplits = (spaces[s].pinnedSplits ?? []) + [onRight ? PinnedSplit(left: pinnedID, right: page.id) : PinnedSplit(left: page.id, right: pinnedID)]
         // The split's right page follows its left one into the folder.
         if !onRight, let f = spaces[s].folders?.firstIndex(where: { $0.bookmarkIDs.contains(pinnedID) }),
@@ -1951,10 +2062,10 @@ final class Library {
         guard let s = spaces.firstIndex(where: { $0.pinnedSplits?.contains { $0.contains(targetID) } == true }),
               let i = spaces[s].pinnedSplits?.firstIndex(where: { $0.contains(targetID) }),
               let grown = spaces[s].pinnedSplits?[i].layout.adding(page.id, drop) else { return }
-        spaces[s].bookmarks.removeAll { $0.id == page.id }
+        removePages([page.id], at: s)
         for f in (spaces[s].folders ?? []).indices { spaces[s].folders?[f].bookmarkIDs.removeAll { $0 == page.id } }
         let after = spaces[s].bookmarks.lastIndex { grown.contains($0.id) }.map { $0 + 1 } ?? spaces[s].bookmarks.count
-        spaces[s].bookmarks.insert(page, at: after)
+        insertPages([page], at: s, at: after)
         if let f = spaces[s].folders?.firstIndex(where: { $0.bookmarkIDs.contains(targetID) }) { spaces[s].folders?[f].bookmarkIDs.append(page.id) }
         spaces[s].pinnedSplits?[i] = PinnedSplit(layout: grown)
         tidyFolders(s)

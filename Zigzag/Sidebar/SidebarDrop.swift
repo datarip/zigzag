@@ -455,8 +455,10 @@ nonisolated struct TabDropSnapshot {
     /// A tab row's middle is the split offer: the two open side by side. A group row's middle takes the tab. The top and
     /// bottom bands of either are gaps, and their level, parent and group come from the rows on either side, never from
     /// a count of rows. `allowsOnto` false is a tab carried from another window, which cannot split or join here: it
-    /// takes the gap at the row's edge like any other.
-    func drop(at pointer: NSPoint, allowsOnto: Bool = true) -> SidebarDrop? {
+    /// takes the gap at the row's edge like any other. `grabbedAt` and `grabDepth` are where a tab of this list was
+    /// picked up; nil for a row carried from another window, whose gaps all follow the row rule.
+    func drop(at pointer: NSPoint, allowsOnto: Bool = true, grabbedAt: CGFloat? = nil,
+              grabDepth: Int = 0) -> SidebarDrop? {
         // A folder stays among the pinned rows: it never lands among the tabs.
         guard kind != .folder, !rows.isEmpty else { return nil }
 
@@ -510,26 +512,75 @@ nonisolated struct TabDropSnapshot {
         let below = stayBelow < rows.count ? rows[stayBelow] : nil
 
         // 3. Where the gap goes, from the rows on either side: the tab it goes under, and its group.
-        let parent = tabGapParent(above: above?.item, below: below?.item)
+        let parent = tabGapParent(above: above?.item, below: below?.item, pointerX: pointer.x,
+                                  grabbedAt: grabbedAt, grabDepth: grabDepth)
         let group = tabGapGroup(above: above?.item, below: below?.item, parent: parent)
 
         // 4. The line's step, as the landed row would be set in: the group's step, then the parent's.
         let depth = (group == nil ? 0 : 1) + (parent.map { TabTree.shownLevel((levels[$0] ?? 0) + 1) } ?? 0)
-        return SidebarDrop(section: .tabs, index: listIndex(atOrAfter: gap), folder: nil,
+        // The parent is stored with the drop, so the line and the landing read one answer. For tabs `folder` is the
+        // tab the row goes under; nil is the top level.
+        return SidebarDrop(section: .tabs, index: listIndex(atOrAfter: gap), folder: parent,
                            place: .gap(above: above?.item, below: below?.item, depth: depth))
     }
 
     /// The tab a gap goes under: right under a tab whose nested tabs show, or between two tabs of one group, it joins
     /// that group. After a group's last row the pointer picks how many levels out it lands, never further out than the
     /// row below. Nil: the top level.
-    func tabGapParent(above: SidebarItem?, below: SidebarItem?) -> UUID? {
+    ///
+    /// The level comes from the rows. Only the two boundary gaps let the pointer's sideways movement pick between them:
+    /// just below the last row inside an open tab, and just below a row with no tabs under it.
+    func tabGapParent(above: SidebarItem?, below: SidebarItem?, pointerX: CGFloat = 0, grabbedAt: CGFloat? = nil,
+                      grabDepth: Int = 0) -> UUID? {
         // Just under a group row: its first slot, top level.
         if case .tabGroup? = above { return nil }
         let before: UUID? = if case .tab(let id)? = above { id } else { nil }
         let after: UUID? = if case .tab(let id)? = below { id } else { nil }
-        // The level is the rows': directly under a tab is inside it, and any other gap sits at the row's own level. The
-        // pointer's x does not step in or out, so the line and the drop cannot disagree.
-        return TabTree.dropParent(before: before, after: after, in: nodes) { _ in false }
+        let setIn: (Int) -> Bool
+        if let level = boundaryLevel(above: above, below: below), let grabbedAt {
+            // The carried row's start, moved across since it was picked up, against the level's own step: past half a
+            // step short of it is set in. Only the boundary's level can be chosen.
+            let x = SidebarListView.nestX(pointer: pointerX, grabbedAt: grabbedAt, depth: grabDepth)
+            setIn = { candidate in candidate == level && SidebarListView.setsIn(x, depth: candidate) }
+        } else {
+            setIn = { _ in false }
+        }
+        return TabTree.dropParent(before: before, after: after, in: nodes, setIn: setIn)
+    }
+
+    /// The level a sideways movement can choose at this gap: one level in past half a step, the row's level short of it.
+    /// Only two gaps offer it. Below the last row inside an open tab, the level is that row's, so a set-in drop becomes
+    /// the tab's last child. Below a row with no children, the level is one deeper, so a set-in drop becomes its first
+    /// child. Nil at every other gap, where the rows alone set the level.
+    private func boundaryLevel(above: SidebarItem?, below: SidebarItem?) -> Int? {
+        // A folder, a group or a pinned page carried over the tabs keeps the row rule. A tab from another window has no
+        // pick-up here, and a nil grab keeps it too.
+        guard kind == .page, carried.contains(where: { if case .tab = $0 { true } else { false } }),
+              let above, case .tab(let id) = above, let node = nodes.first(where: { $0.id == id }) else { return nil }
+        let level = levels[id] ?? 0
+        let belowTab: UUID? = if case .tab(let id)? = below { id } else { nil }
+        let belowIsOtherRow = below != nil && belowTab == nil
+        func inside(_ other: UUID, _ folder: UUID) -> Bool {
+            var parent = nodes.first { $0.id == other }?.parent
+            var seen: Set<UUID> = [other]
+            while let id = parent, seen.insert(id).inserted {
+                if id == folder { return true }
+                parent = nodes.first { $0.id == id }?.parent
+            }
+            return false
+        }
+        // 1. A row with no tabs under it, where a tab can still go under it: below it is its sibling, or the end of
+        // the list. Set in, the tab becomes that row's first child.
+        let childless = !nodes.contains(where: { $0.parent == id })
+        let sibling = belowTab.map { other in nodes.first { $0.id == other }?.parent == node.parent } ?? true
+        if childless, TabTree.canNestUnder(level: level), !belowIsOtherRow, sibling { return level + 1 }
+        // 2. The last row inside an open tab: below it is outside that tab, or the end of the list. At the deepest
+        // level a tab can go under no row, so set in the tab becomes the open tab's last child instead.
+        if let folder = node.parent {
+            let staysInside = belowTab.map { inside($0, folder) } ?? false
+            if !staysInside { return level }
+        }
+        return nil
     }
 
     /// The tab group a gap goes into: under one of its tabs, right under its row, or between its tabs; after its last
@@ -574,6 +625,12 @@ nonisolated struct TabDropSnapshot {
     func line(for drop: SidebarDrop, rowGap: CGFloat) -> DropLine? {
         switch drop.place {
         case .gap(let above, let below, let depth):
+            // The carried rows stay, faint, in their places. A gap at their place draws under the row above them,
+            // clear of their copy, as #526 asked: the row below is the first that stays after the whole block.
+            if let above, let at = rows.firstIndex(where: { $0.item == above }), at + 1 < rows.count,
+               carried.contains(rows[at + 1].item) {
+                return DropLine(y: rows[at].frame.maxY + rowGap / 2, depth: depth)
+            }
             if let below, let row = rows.first(where: { $0.item == below }) {
                 return DropLine(y: row.frame.minY - rowGap / 2, depth: depth)
             }

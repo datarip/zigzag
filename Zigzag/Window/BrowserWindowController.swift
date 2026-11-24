@@ -3834,6 +3834,25 @@ extension BrowserWindowController: SidebarDelegate {
             self?.pageChange(String(localized: "Move Pinned Tab", comment: "Undo action name, shown in the Edit menu as Undo Move Pinned Tab.")) { Library.shared.moveBookmark(id, to: index, in: spaceID, folder: .some(folder)) }
         }
     }
+    /// A pinned page or folder dropped where the drag resolved: the place transaction changes the pages and every
+    /// folder's place together, so one ⌘Z takes it all back. A drop that leaves the rows as they were records nothing.
+    func listMovePinned(_ item: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) {
+        guard !tabManager.isPrivate else { return }
+        let folder: Bool = if case .folder = item { true } else { false }
+        let name = folder
+            ? (drop.folder == nil
+               ? String(localized: "Move Folder", comment: "Undo action name, shown in the Edit menu as Undo Move Folder.")
+               : String(localized: "Move into Folder", comment: "Undo action name, shown in the Edit menu as Undo Move into Folder."))
+            : String(localized: "Move Pinned Tab", comment: "Undo action name, shown in the Edit menu as Undo Move Pinned Tab.")
+        let change = { _ = Library.shared.movePinned(item, to: drop, in: spaceID) }
+        if case .bookmark(let id) = item {
+            confirmProfileCrossing(pinned: id, to: spaceID) { [weak self] in
+                self?.pageChange(name, change)
+            }
+        } else {
+            pageChange(name, change)
+        }
+    }
     func listMoveFolder(_ id: UUID, to index: Int, in spaceID: UUID, parent: UUID?) {
         guard !tabManager.isPrivate else { return }
         pageChange(parent == nil ? String(localized: "Move Folder", comment: "Undo action name, shown in the Edit menu as Undo Move Folder.") : String(localized: "Move into Folder", comment: "Undo action name, shown in the Edit menu as Undo Move into Folder.")) { Library.shared.moveFolder(id, to: index, in: spaceID, parent: .some(parent)) }

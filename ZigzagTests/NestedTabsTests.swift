@@ -143,22 +143,39 @@ struct NestedTabsTests {
         #expect(TabTree.repaired(moved) == moved)
     }
 
-    @Test func movingAcrossSetsTheCarriedRowInAndOut() {
-        let step = SidebarListView.folderIndent
-        // A top-level row picked up at x 100: where it was, it sets in no further than its own level.
-        let still = SidebarListView.nestX(pointer: 100, grabbedAt: 100, depth: 0)
-        #expect(SidebarListView.setsIn(still, depth: 0) && !SidebarListView.setsIn(still, depth: 1))
-        // Past half a step right, a level in; a step and a half, two.
-        let half = SidebarListView.nestX(pointer: 100 + step / 2 + 1, grabbedAt: 100, depth: 0)
-        #expect(SidebarListView.setsIn(half, depth: 1) && !SidebarListView.setsIn(half, depth: 2))
-        let more = SidebarListView.nestX(pointer: 100 + step * 1.5 + 1, grabbedAt: 100, depth: 0)
-        #expect(SidebarListView.setsIn(more, depth: 2))
-        // Less than half a step, a slip, not a move.
-        #expect(!SidebarListView.setsIn(SidebarListView.nestX(pointer: 100 + step / 2 - 1, grabbedAt: 100, depth: 0), depth: 1))
-        // A nested row (a level in) stays at its level where it was, and goes out past half a step left.
-        let nested = SidebarListView.nestX(pointer: 60, grabbedAt: 60, depth: 1)
-        #expect(SidebarListView.setsIn(nested, depth: 1) && !SidebarListView.setsIn(nested, depth: 2))
-        #expect(!SidebarListView.setsIn(SidebarListView.nestX(pointer: 60 - step / 2 - 1, grabbedAt: 60, depth: 1), depth: 1))
+    @MainActor @Test func movingAcrossSetsTheCarriedRowInAndOut() throws {
+        let tree = TabDropFixture.standard()
+        let cID = try tree.tabID("C")
+        let c = SidebarItem.tab(cID)
+        let a1 = SidebarItem.tab(try tree.tabID("A1"))
+        let a1ID = try tree.tabID("A1")
+        let a1a = SidebarItem.tab(try tree.tabID("A1a"))
+        let b = SidebarItem.tab(try tree.tabID("B"))
+        let half = SidebarListView.folderIndent / 2
+        // An ordinary gap keeps the row's level wherever the pointer is across: above A1 and above A1a.
+        for gap in [a1, a1a] {
+            let left = try #require(tree.drop(try tree.point(in: gap, .above, x: 0), carrying: c, grabbedAt: 0))
+            let right = try #require(tree.drop(try tree.point(in: gap, .above, x: 200), carrying: c, grabbedAt: 0))
+            #expect(left.place == right.place)
+            #expect(left.folder == right.folder)
+        }
+        // The last row inside A1 is a boundary: short of half a step it lands after A, past it inside A1.
+        let outside = try #require(tree.drop(try tree.point(in: a1a, .below, x: SidebarListView.indent(depth: 2) - half - 1),
+                                             carrying: c, grabbedAt: 0))
+        #expect(outside.place == .gap(above: a1a, below: b, depth: 0))
+        let inside = try #require(tree.drop(try tree.point(in: a1a, .below, x: SidebarListView.indent(depth: 2) - half + 1),
+                                            carrying: c, grabbedAt: 0))
+        #expect(inside.place == .gap(above: a1a, below: b, depth: 2))
+        #expect(inside.folder == a1ID)
+        // A row with no children is the other boundary: after it, or its first child.
+        let endOutside = try #require(tree.drop(try tree.point(in: c, .below, x: 0), carrying: SidebarItem.tab(try tree.tabID("B")),
+                                                grabbedAt: 0))
+        let endInside = try #require(tree.drop(try tree.point(in: c, .below, x: SidebarListView.indent(depth: 1) + 1),
+                                               carrying: SidebarItem.tab(try tree.tabID("B")), grabbedAt: 0))
+        #expect(endOutside.place == .gap(above: c, below: nil, depth: 0))
+        #expect(endOutside.folder == nil)
+        #expect(endInside.place == .gap(above: c, below: nil, depth: 1))
+        #expect(endInside.folder == cID)
     }
 
     @Test func nestTabGoesUnderTheTabAboveAtItsLevel() {
