@@ -57,6 +57,14 @@ final class FavoritesView: NSView {
     /// The favorite whose middle it's over, and on which side it would open.
     private(set) var splitTarget: (id: UUID, onRight: Bool)?
 
+    /// What a pointer is over in the grid: a tile's middle, or the gap before a tile. The same one again is the same
+    /// offer, so a drag only moves the bar or lights a tile when it really changed place.
+    private enum DropRegion: Equatable {
+        case gap(Int)
+        case tile(UUID, onRight: Bool)
+    }
+    private var region: DropRegion?
+
     /// Carried over the grid at this point (in window coordinates). `carrying`: what's carried, as one side of a
     /// split (nil: it can't open beside a favorite).
     func hoverDrop(at windowPoint: NSPoint, carrying: TabManager.SplitSide?) {
@@ -117,31 +125,55 @@ final class FavoritesView: NSView {
     /// Where something carried over the grid would go, from a point in this view: beside a favorite as a split, or
     /// between two. `moving`: a favorite of this grid being moved, which stays where it is meanwhile.
     private func aim(at point: NSPoint, carried: TabManager.SplitSide?, moving: FavoriteTile?) {
-        guard !tiles.isEmpty else { dropIndex = 0; return }
+        guard !tiles.isEmpty else {
+            guard region != .gap(0) else { return }
+            region = .gap(0)
+            dropIndex = 0
+            return
+        }
         // Most of a tile, away from its edges, is for a split.
         let middle = tiles.first { tile in
             guard tile !== moving, let carried, tile.frame.insetBy(dx: tile.frame.width * 0.2, dy: tile.frame.height * 0.2).contains(point) else { return false }
             return TabManager.canSplit(carried, onto: TabManager.SplitSide(kind: kind, inSplit: !tile.partners.isEmpty))
         }
+        let next: DropRegion
         if let middle, let id = middle.bookmark?.id {
-            showSplit((id, point.x > middle.frame.midX))
+            next = .tile(id, onRight: point.x > middle.frame.midX)
+        } else {
+            next = .gap(gap(at: point))
+        }
+        // The same tile, or the same gap, is the same offer: the bar, the split and the tiles stay as they are. A grid
+        // scrolling under a still pointer moves the bar with it, so a bar on show is put in its place again.
+        guard next != region else {
+            if case let .gap(index) = next, !dropBar.isHidden { placeBar(at: index) }
+            return
+        }
+        region = next
+        if case let .tile(id, onRight) = next {
+            showSplit((id, onRight))
             dropBar.isHidden = true
             return
         }
+        guard case let .gap(index) = next else { return }
         showSplit(nil)
-        // The row of tiles at the pointer's height, and the slot in it by which tiles' middles it's past.
+        dropIndex = index
+        // Next to where the carried favorite already is, it wouldn't move: no bar.
+        if let moving, let from = tiles.firstIndex(where: { $0 === moving }), index == from || index == from + 1 {
+            dropBar.isHidden = true
+            return
+        }
+        placeBar(at: index)
+    }
+
+    /// The slot the pointer is over between tiles: the row at its height, and the tiles in it it's past.
+    private func gap(at point: NSPoint) -> Int {
         let row = tiles.filter { point.y >= $0.frame.minY - Tokens.Space.x2 / 2 }.last.map { $0.frame.minY }
         let rowStart = tiles.firstIndex { $0.frame.minY == row } ?? 0
-        dropIndex = rowStart + tiles[rowStart...].prefix { $0.frame.minY == row && $0.frame.midX < point.x }.count
-        // Next to where the carried favorite already is, it wouldn't move: no bar.
-        if let moving, let from = tiles.firstIndex(where: { $0 === moving }), dropIndex == from || dropIndex == from + 1 {
-            dropBar.isHidden = true
-            return
-        }
-        placeBar(at: dropIndex ?? tiles.count)
+        return rowStart + tiles[rowStart...].prefix { $0.frame.minY == row && $0.frame.midX < point.x }.count
     }
 
     private func clearAim() {
+        region = nil
         dropIndex = nil
         showSplit(nil)
         dropBar.isHidden = true
@@ -169,7 +201,8 @@ final class FavoritesView: NSView {
             dropBar.frame = NSRect(x: min(max(x - width / 2, 0), bounds.width - width), y: row.minY + 6, width: width, height: row.height - 12)
         }
         dropBar.isHidden = false
-        addSubview(dropBar, positioned: .above, relativeTo: nil)
+        // Above the tiles, once: a bar that is already on top stays there when it only moves.
+        if subviews.last !== dropBar { addSubview(dropBar, positioned: .above, relativeTo: nil) }
     }
 
     var onHeightChange: (() -> Void)?

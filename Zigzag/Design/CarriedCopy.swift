@@ -20,6 +20,8 @@ final class CarriedCopy {
     private let radius: CGFloat, alternateRadius: CGFloat
     /// The panel fits either shape with room for the shadow; the pointer stays at this spot in it.
     private let anchor: NSPoint
+    /// Where the panel was last put: the next follow to the same place does nothing.
+    private var origin: NSPoint?
     private static let margin: CGFloat = 20
 
     /// A copy of `view`, held where the pointer pressed it (a point on screen). `ground`: drawn under the picture, for
@@ -165,9 +167,12 @@ final class CarriedCopy {
         Tokens.Motion.animate(Tokens.Motion.feedback) { self.panel.animator().alphaValue = Self.opacity }
     }
 
-    /// Keeps the pointer where it holds the copy.
+    /// Keeps the pointer where it holds the copy. A move to where the panel already sits is no move.
     func follow(_ screenPoint: NSPoint) {
-        panel.setFrameOrigin(NSPoint(x: screenPoint.x - anchor.x, y: screenPoint.y - anchor.y))
+        let target = NSPoint(x: screenPoint.x - anchor.x, y: screenPoint.y - anchor.y)
+        guard origin != target else { return }
+        origin = target
+        panel.setFrameOrigin(target)
     }
 
     /// Shows the second shape (true) or the item's own.
@@ -196,6 +201,7 @@ final class CarriedCopy {
     /// fades where it is.
     func land(on view: NSView?, completion: (@MainActor () -> Void)? = nil) {
         let panel = self.panel
+        origin = nil
         guard let view, let window = view.window, window.isVisible, !view.isHiddenOrHasHiddenAncestor else {
             Tokens.Motion.animate(Tokens.Motion.feedback, { panel.animator().alphaValue = 0 }, completion: {
                 panel.orderOut(nil)

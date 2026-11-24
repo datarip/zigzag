@@ -2103,6 +2103,31 @@ enum DebugBridge {
             event(.leftMouseUp, n[2]).map { NSApp.postEvent($0, atStart: false) }
             event(.leftMouseDragged, n[1] + (n[2] - n[1]) / 8).map(window.sendEvent)
             debugLog("dragpath \(arg) done")
+        case "dragmeasure":
+            // dragmeasure x y1 y2 [steps]: the drag `dragpath` makes, in that many moves (60 unless given), each one
+            // timed. Logs the resolver's average and worst pass, the worst whole move on the main thread, and how many
+            // moves changed the target or moved the line, so a drag on a big space can be measured without a hand.
+            let f = arg.split(separator: " ").compactMap { Double($0) }
+            guard f.count >= 3, let window = controller.window else { break }
+            let steps = max(2, Int(f.count > 3 ? f[3] : 60))
+            SidebarDragTiming.reset()
+            SidebarDragTiming.measured = true
+            func event(_ type: NSEvent.EventType, _ y: Double) -> NSEvent? {
+                NSEvent.mouseEvent(with: type, location: NSPoint(x: f[0], y: window.frame.height - y), modifierFlags: [],
+                                   timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                   context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)
+            }
+            for step in 2...steps {
+                event(.leftMouseDragged, f[1] + (f[2] - f[1]) * Double(step) / Double(steps)).map { NSApp.postEvent($0, atStart: false) }
+            }
+            event(.leftMouseUp, f[2]).map { NSApp.postEvent($0, atStart: false) }
+            // A press only becomes a drag 4 points in, as a hand's does: the press and its first move are sent straight
+            // in, and the moves queued behind it are taken by the drag it starts.
+            event(.leftMouseDown, f[1]).map(window.sendEvent)
+            let lead = min(5, abs(f[2] - f[1])) * (f[2] < f[1] ? -1 : 1)
+            event(.leftMouseDragged, f[1] + lead).map(window.sendEvent)
+            SidebarDragTiming.measured = false
+            debugLog("dragmeasure \(arg) => " + SidebarDragTiming.report())
         case "mouse":
             // mouse <down|drag|up|move|click|rclick> x y [shift|cmd|opt]  (window points, top-left origin)
             let f = arg.split(separator: " ").map(String.init)

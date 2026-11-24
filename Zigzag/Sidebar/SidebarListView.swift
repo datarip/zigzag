@@ -1,4 +1,5 @@
 import AppKit
+import os
 
 protocol SidebarListDelegate: AnyObject {
     var tabManager: TabManager { get }
@@ -162,6 +163,102 @@ nonisolated enum SidebarItem: Hashable {
     }
 }
 
+/// Signposts around the drag's two per-move paths: one resolver pass, and one line move. A drag that feels slow then
+/// reads in Instruments as those two intervals. A debug build also keeps the worst of each, for `dragmeasure` to say.
+@MainActor
+enum SidebarDragTiming {
+    private static let signposter = OSSignposter(subsystem: "wang.zigao.zigzag", category: "sidebar-drag")
+
+    struct Interval {
+        fileprivate let name: StaticString
+        fileprivate let state: OSSignpostIntervalState
+        fileprivate let start: CFTimeInterval
+
+        /// Ends the signpost, and gives back how long it ran.
+        func end() -> CFTimeInterval {
+            SidebarDragTiming.signposter.endInterval(name, state)
+            return CACurrentMediaTime() - start
+        }
+    }
+
+    static func begin(_ name: StaticString) -> Interval {
+        Interval(name: name, state: signposter.beginInterval(name), start: CACurrentMediaTime())
+    }
+
+    /// The main thread's own running time. A move's wall time also counts the process waiting to be given the CPU
+    /// again, which is the machine's business; this is what the drag itself costs.
+    static func threadTime() -> CFTimeInterval {
+        CFTimeInterval(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)) / 1_000_000_000
+    }
+
+    #if DEBUG
+    /// Whether a `dragmeasure` run keeps the numbers; false, a drag only adds signposts.
+    static var measured = false
+    static var moves = 0
+    static var targetChanges = 0
+    static var lineMoves = 0
+    static var taps = 0
+    private static var dropCount = 0
+    private static var dropTotal: CFTimeInterval = 0
+    private static var dropWorst: CFTimeInterval = 0
+    private static var moveWorst: CFTimeInterval = 0
+    private static var moveWorstCPU: CFTimeInterval = 0
+    private static var worstMove = 0
+    private static var worstMoveChanged = false
+    private static var changedInMove = false
+
+    static func reset() {
+        moves = 0; targetChanges = 0; lineMoves = 0; taps = 0
+        dropCount = 0; dropTotal = 0; dropWorst = 0; moveWorst = 0; moveWorstCPU = 0
+        worstMove = 0; worstMoveChanged = false; changedInMove = false
+    }
+
+    /// A resolver pass, `seconds` long.
+    static func dropRan(_ seconds: CFTimeInterval) {
+        guard measured else { return }
+        dropCount += 1
+        dropTotal += seconds
+        dropWorst = max(dropWorst, seconds)
+    }
+
+    /// One pointer move: its wall time on the main thread, and the thread's own time in it.
+    static func moved(_ seconds: CFTimeInterval, cpu: CFTimeInterval) {
+        guard measured else { return }
+        moves += 1
+        moveWorstCPU = max(moveWorstCPU, cpu)
+        if seconds > moveWorst {
+            moveWorst = seconds
+            worstMove = moves
+            worstMoveChanged = changedInMove
+        }
+        changedInMove = false
+    }
+
+    static func targetChanged() {
+        guard measured else { return }
+        targetChanges += 1
+        changedInMove = true
+    }
+    static func lineMoved() { if measured { lineMoves += 1 } }
+    static func tapped() { if measured { taps += 1 } }
+
+    static func report() -> String {
+        let average = dropCount > 0 ? dropTotal / Double(dropCount) : 0
+        return String(format: "moves=%d targets=%d lineMoves=%d taps=%d pinnedDrop=%d avg=%.3fms worst=%.3fms moveWorst=%.3fms cpu=%.3fms at=%d changed=%@",
+                      moves, targetChanges, lineMoves, taps, dropCount, average * 1000, dropWorst * 1000, moveWorst * 1000,
+                      moveWorstCPU * 1000, worstMove, worstMoveChanged ? "yes" : "no")
+    }
+    #else
+    static func reset() {}
+    static func dropRan(_ seconds: CFTimeInterval) {}
+    static func moved(_ seconds: CFTimeInterval, cpu: CFTimeInterval) {}
+    static func targetChanged() {}
+    static func lineMoved() {}
+    static func tapped() {}
+    static func report() -> String { "" }
+    #endif
+}
+
 /// The scrolling list of bookmarks and tabs. Rows are reused by identity and animate between layouts.
 final class SidebarListView: NSView {
     /// Re-lays the list when the space name's style changes in Settings.
@@ -233,6 +330,9 @@ final class SidebarListView: NSView {
     private var wasOverFavorites = false
     private var lastFolderTarget: UUID?
     private var lastSplitTarget: SplitDrop?
+    /// The drag move being handled, and the one that has already tapped: a move that changes several targets taps once.
+    private var moveTick = 0
+    private var tappedTick = -1
     var isDragging: Bool { drag != nil }
     private let rowGap: CGFloat = Tokens.Sidebar.rowGap
 
@@ -303,6 +403,17 @@ final class SidebarListView: NSView {
     nonisolated enum Section { case bookmarks, tabs }
 
     override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // Made once, hidden, so a drag only ever moves it: rows are added below it afterwards, and it stays above them.
+        // Layer-backed so a move is one frame set on the layer, with the transaction's actions off (see `showLine`).
+        insertionLine.wantsLayer = true
+        insertionLine.isHidden = true
+        addSubview(insertionLine)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
 
     // MARK: Model
 
@@ -860,9 +971,20 @@ final class SidebarListView: NSView {
         return nil
     }
 
-    /// Lights the folder or group row that takes the drop.
+    /// One tap for a move that changes the target, however many of its parts changed: the first tap in a move is the
+    /// one the hand feels.
+    private func tapForTarget() {
+        guard tappedTick != moveTick else { return }
+        tappedTick = moveTick
+        Haptics.snap()
+        SidebarDragTiming.tapped()
+    }
+
+    /// Lights the folder or group row that takes the drop. A new target is the only news: the same one again changes
+    /// nothing, so the rows are left alone.
     private func showFolderTarget(_ id: UUID?) {
-        if let id, id != lastFolderTarget { Haptics.snap() }
+        guard id != lastFolderTarget else { return }
+        if id != nil { tapForTarget() }
         lastFolderTarget = id
         for (item, view) in rows {
             guard let row = view as? FolderRowView, let rowID = Self.folderRowID(item) else { continue }
@@ -1837,7 +1959,9 @@ final class SidebarListView: NSView {
         // In a private window the pinned pages can't change, so nothing drags into them.
         guard manager?.isPrivate == false else { return nil }
         guard drag.snapshot.kind == .folder || point.y < tabsBoundary else { return nil }
+        let interval = SidebarDragTiming.begin("pinnedDrop")
         let drop = drag.snapshot.drop(at: point)
+        SidebarDragTiming.dropRan(interval.end())
         // A live folder fills itself: nothing lands inside one, and its own pages keep their order.
         if let folder = drop?.folder, Library.shared.folder(folder)?.live != nil { return nil }
         return drop
@@ -2252,6 +2376,8 @@ final class SidebarListView: NSView {
         return nil
     }
 
+    /// The line is on show: the next one that shows after this fades in again.
+    private var lineShown = false
     private let insertionLine = InsertionLineView()
 
     /// Whether the row being carried is in the list on show: in its own space it stays there, faint; carried to
@@ -2336,21 +2462,37 @@ final class SidebarListView: NSView {
         }
     }
 
-    /// Puts the line at a y, set in by a level, and shows it.
+    /// Puts the line at a y, set in by a level, and shows it. A line that has just appeared fades in, so the eye catches
+    /// the place it went; while it follows the pointer it moves at once, with no lag. A move that would leave it where it
+    /// already is does nothing at all, and a move that does land sets the frame with the layer's own actions off.
     private func showLine(at y: CGFloat, depth: Int) {
         let x = Self.indent(depth: depth)
         // The bar is centred on the gap's edge. Its top half sits in the gap and its bottom half over the first points
-        // of the row below, which are that row's own top band: both resolve to the gap the line shows.
+        // of the row below, which are that row's own top band: both resolve to the gap the line shows. It must not reach
+        // into the middle of the row below, where the target changes, nor up into the row above.
         let rect = NSRect(x: x, y: round(y) - 3, width: max(0, bounds.width - x), height: 6)
-        if insertionLine.superview !== self { addSubview(insertionLine) }
+        if lineShown, !insertionLine.isHidden, insertionLine.frame == rect { return }
+        let appearing = !lineShown
+        SidebarDragTiming.lineMoved()
+        let interval = SidebarDragTiming.begin("line")
         Tokens.Motion.withoutAnimation { insertionLine.frame = rect }
         insertionLine.isHidden = false
-        addSubview(insertionLine, positioned: .above, relativeTo: nil)
+        lineShown = true
+        if appearing {
+            insertionLine.alphaValue = 0
+            Tokens.Motion.animate(Tokens.Motion.feedback) { self.insertionLine.animator().alphaValue = 1 }
+        } else {
+            insertionLine.alphaValue = 1
+        }
+        _ = interval.end()
     }
 
-    /// Takes the line away.
+    /// Takes the line away, so the next one that shows fades in again.
     private func hideLine() {
+        guard lineShown || !insertionLine.isHidden else { return }
         insertionLine.isHidden = true
+        lineShown = false
+        Tokens.Motion.withoutAnimation { insertionLine.alphaValue = 1 }
     }
 
     /// The line for something carried in from elsewhere (another window's tab, a favorite). It resolves against the
@@ -2421,13 +2563,17 @@ final class SidebarListView: NSView {
     private var splitCandidate: SplitDrop?
     private var splitWork: DispatchWorkItem?
 
+    /// Lights the half of a tab's or pinned page's row the carried row would take. Only a new target touches rows: the
+    /// row it left goes out, the row it came to lights, and the same offer again changes nothing.
     private func showSplitTarget(_ target: SplitDrop?) {
-        if let target, target != lastSplitTarget { Haptics.snap() }
+        guard target != lastSplitTarget else { return }
+        if target != nil { tapForTarget() }
+        let previous = lastSplitTarget
         lastSplitTarget = target
         drag?.splitTarget = target
-        for (item, view) in rows {
-            guard let row = view as? TabRowView else { continue }
-            row.splitDropSide = target.flatMap { item == .tab($0.id) || item == .bookmark($0.id) ? ($0.onRight ? 1 : 0) : nil }
+        for id in Set([previous?.id, target?.id].compactMap { $0 }) {
+            guard let row = (rows[.tab(id)] ?? rows[.bookmark(id)]) as? TabRowView else { continue }
+            row.splitDropSide = id == target?.id ? (target?.onRight == true ? 1 : 0) : nil
         }
         placeLine()
     }
@@ -2551,6 +2697,13 @@ final class SidebarListView: NSView {
 
     private func dragMoved(to event: NSEvent) {
         guard var drag, let window else { return }
+        moveTick &+= 1
+        #if DEBUG
+        let moveStarted = CACurrentMediaTime(), moveStartedCPU = SidebarDragTiming.threadTime()
+        defer {
+            SidebarDragTiming.moved(CACurrentMediaTime() - moveStarted, cpu: SidebarDragTiming.threadTime() - moveStartedCPU)
+        }
+        #endif
         let mouse = window.convertPoint(toScreen: event.locationInWindow)
         drag.copy.follow(mouse)
         let hit = Self.list(at: mouse)
@@ -2600,7 +2753,7 @@ final class SidebarListView: NSView {
         let overFavorites = drag.item.canBeFavorite && drag.pinnable && inWindow && !isInPinnedSection(windowPoint)
             ? delegate?.listDragOverFavorites(at: windowPoint, carrying: splitSide(of: drag.item)) ?? false
             : delegate?.listDragOverFavorites(at: nil, carrying: nil) ?? false
-        if overFavorites, !wasOverFavorites { Haptics.snap() }
+        if overFavorites, !wasOverFavorites { tapForTarget() }
         wasOverFavorites = overFavorites
 
         // Over this window's page (not the sidebar): offer to open the tab or pinned page beside it.
@@ -2710,6 +2863,8 @@ final class SidebarListView: NSView {
                     let work = DispatchWorkItem { [weak self] in
                         MainActor.assumeIsolated {
                             guard let self, self.drag != nil, self.splitCandidate == candidate else { return }
+                            // A move of its own, so the offer that waited can tap even if the move that began it did.
+                            self.moveTick &+= 1
                             self.showSplitTarget(candidate)
                         }
                     }
@@ -2738,18 +2893,23 @@ final class SidebarListView: NSView {
                 springWork = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
             }
-            if hovered != nil { Haptics.snap() }
+            if hovered != nil { tapForTarget() }
         }
         drag.hoverSpace = hovered
         // On the space dots it's going to a space, not to a place in this list: no line meanwhile.
         if hovered != nil { section = nil; drop = nil }
         // Crossing between pinned tabs and tabs is a different kind of place: a tap says so.
-        if let section, let old = drag.targetSection, section != old { Haptics.snap() }
+        if let section, let old = drag.targetSection, section != old { tapForTarget() }
+        // Nothing it would land on has changed: the line, the highlight and the line's place all stay as they are.
+        let targetChanged = section != drag.targetSection || index != drag.targetIndex || drop != drag.drop
         drag.targetSection = section
         drag.targetIndex = index
         drag.drop = drop
         self.drag = drag
-        placeLine()
+        if targetChanged {
+            SidebarDragTiming.targetChanged()
+            placeLine()
+        }
     }
 
     /// Ends a drag: let go at a point on screen, or called off with Esc (nil), changing nothing. The copy lands on

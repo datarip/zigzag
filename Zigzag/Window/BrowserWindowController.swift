@@ -551,6 +551,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private var favoriteSpringTarget: (space: UUID, work: DispatchWorkItem)?
     /// The space a favorite's drag started in, to go back to if it's called off.
     private var favoriteDragOrigin: UUID?
+    /// The space dot a sidebar drag is over, and where it sits in the window: a pointer that stays inside it is the
+    /// same answer, so the dots are left alone.
+    private var dragDot: (space: UUID, rect: NSRect)?
+    /// Where the page's split hint last sat. The same region again shows the same offer, so only its pill moves.
+    private var dragPageDrop: TileDrop?
     private func favoriteSpring(at windowPoint: NSPoint?) {
         let hovered = windowPoint.flatMap { sidebar.spaceDot(at: $0) }
         guard hovered != favoriteSpringTarget?.space else { return }
@@ -3807,8 +3812,16 @@ extension BrowserWindowController: SidebarDelegate {
         guard row?.window === window || tab == nil else { return }
         previews.hover(tab, row: row, bookmark: bookmark)
     }
-    func listDragHoverSpace(at windowPoint: NSPoint) -> UUID? { sidebar.spaceDot(at: windowPoint) }
+    func listDragHoverSpace(at windowPoint: NSPoint) -> UUID? {
+        // The same dot holds still: only a move onto another one, or off them, changes what is lit.
+        if let dragDot, dragDot.rect.contains(windowPoint) { return dragDot.space }
+        let space = sidebar.spaceDot(at: windowPoint)
+        dragDot = space.flatMap { id in sidebar.dot(for: id).map { (id, $0.convert($0.bounds, to: nil)) } }
+        return space
+    }
     func listDragEnded() {
+        dragDot = nil
+        dragPageDrop = nil
         sidebar.clearDropTargets()
         sidebar.favorites.isDropTarget = false
         sidebar.pinnedTiles.isDropTarget = false
@@ -4338,9 +4351,21 @@ extension BrowserWindowController: SidebarDelegate {
     func listZoomPane(_ tab: Tab) { toggleZoom(tab) }
 
     func listDragOverPage(at windowPoint: NSPoint?, item: SidebarItem) {
-        guard let windowPoint, canDropBeside(item), let current = shownTab ?? tabManager.selectedTab else { root.splitDropHint.show(nil); return }
+        guard let windowPoint, canDropBeside(item), let current = shownTab ?? tabManager.selectedTab else {
+            dragPageDrop = nil
+            root.splitDropHint.show(nil)
+            return
+        }
         root.splitDropHint.incoming = carried(item)
-        showDropHint(at: windowPoint, beside: current)
+        // The same place on the page is the same offer: the hint keeps its zone, and only the pill under the pointer
+        // can move. A new place on it shows the new offer, and taps once.
+        let hint = root.splitDropHint
+        hint.follow(windowPoint)
+        let drop = hint.drop(at: windowPoint, shape: tabManager.split(for: current)?.shape, gap: root.paneGap)
+        guard drop != dragPageDrop else { return }
+        dragPageDrop = drop
+        if let drop, drop.kind != hint.drop?.kind { Haptics.snap() }
+        hint.show(drop)
     }
 
     /// The icon and title of a row carried over the page, as its row shows them.
