@@ -43,7 +43,7 @@ struct SidebarDeleteKeyTests {
         func listSwitchSpaceDuringDrag(_ spaceID: UUID) {}
         func listDropOutside(_ tabs: [Tab], at screenPoint: NSPoint) -> Bool { false }
         func listMoveToWindow(_ tabs: [Tab], controller: BrowserWindowController, index: Int) -> Bool { false }
-        func listMovePinnedToWindow(_ bookmarkID: UUID, controller: BrowserWindowController, at screenPoint: NSPoint) -> NSView? { nil }
+        func listMovePinnedToWindow(_ bookmarkID: UUID, controller: BrowserWindowController, to drop: SidebarDrop?, at screenPoint: NSPoint) -> NSView? { nil }
         func listMoveBookmark(_ id: UUID, to index: Int, in spaceID: UUID) {}
         func listDragOverFavorites(at windowPoint: NSPoint?, carrying: TabManager.SplitSide?) -> Bool { false }
         func listSplit(_ tab: Tab, with other: Tab, otherOnRight: Bool) {}

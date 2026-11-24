@@ -59,7 +59,7 @@ protocol SidebarListDelegate: AnyObject {
     /// Tabs dropped into another window's sidebar at an index, in order. Returns true if handled.
     func listMoveToWindow(_ tabs: [Tab], controller: BrowserWindowController, index: Int) -> Bool
     /// A pinned page dropped into another window's sidebar at a point on screen. Returns the row it landed as.
-    func listMovePinnedToWindow(_ bookmarkID: UUID, controller: BrowserWindowController, at screenPoint: NSPoint) -> NSView?
+    func listMovePinnedToWindow(_ bookmarkID: UUID, controller: BrowserWindowController, to drop: SidebarDrop?, at screenPoint: NSPoint) -> NSView?
     func listMoveBookmark(_ id: UUID, to index: Int, in spaceID: UUID)
     /// A tab or bookmark dragged over the favorites grid (nil: it's not over this window). Returns true while it's
     /// over the grid.
@@ -268,6 +268,11 @@ final class SidebarListView: NSView {
         var originIndex = 0
         /// The folder the picked-up row sat in, when it is over the pinned rows: the same test, for a folder drop.
         var originFolder: UUID?
+        /// Over another window's sidebar: the one place its tab snapshot resolved, which the line there and the drop
+        /// both read. Nil when the pointer is elsewhere or over that list's pinned rows.
+        var externalDrop: SidebarDrop?
+        /// Over another window's favorites grid: that window takes the drop as a favorite there.
+        var externalFavorite: BrowserWindowController?
         /// The space it was picked up in; carried to another, it's no longer in the list on show.
         let originSpace: UUID
         /// Where the pointer picked the row up, and how far in it sat, for the two gaps where a sideways movement
@@ -286,6 +291,13 @@ final class SidebarListView: NSView {
 
     /// Something carried in from elsewhere (another window's tab, a favorite): where the line shows it would land.
     private var external: (section: Section, index: Int, pointX: CGFloat)?
+    /// The tab snapshot target an external tab resolves to, made once per pointer position. The line and the drop
+    /// read this, not a row count and a placeholder worked out again.
+    private var externalDrop: SidebarDrop?
+    private var externalSnapshot: TabDropSnapshot?
+    /// The pinned rows' snapshot for a tab from another window over the pinned section: it can land there now.
+    private var externalPinnedSnapshot: DragSnapshot?
+
     /// The two sections the list shows: the pinned rows and the tabs. Nonisolated so the drag resolver, which reads
     /// the section of a drop, can compare it off the main actor.
     nonisolated enum Section { case bookmarks, tabs }
@@ -2005,22 +2017,62 @@ final class SidebarListView: NSView {
     }
 
     /// Something from elsewhere hovering this list: the line shows where it would land (nil to hide it).
-    /// `allowsPinned`: what's carried can land among the pinned tabs too (a favorite), not only among the tabs.
-    func externalHover(at screenPoint: NSPoint?, allowsPinned: Bool = false) {
+    /// `allowsPinned`: what's carried can land among the pinned tabs too. `carrying`: the row being carried, so a tab
+    /// can resolve against the pinned rows as a page does, and one that is pinned itself leaves its row out.
+    /// Returns the target it resolved, for the window carrying it to use at the drop: the same value the line shows.
+    @discardableResult
+    func externalHover(at screenPoint: NSPoint?, allowsPinned: Bool = false, carrying: SidebarItem? = nil) -> SidebarDrop? {
         var landing: (section: Section, index: Int, pointX: CGFloat)?
+        var resolved: SidebarDrop?
+        var snapshot: TabDropSnapshot?
+        var pinnedSnapshot: DragSnapshot?
         if let screenPoint, let window {
-            let point = convert(window.convertPoint(fromScreen: screenPoint), from: nil)
-            let (section, index) = target(at: point.y, allowsPinned: allowsPinned, carried: [])
-            landing = (section, index, point.x)
+            let local = convert(window.convertPoint(fromScreen: screenPoint), from: nil)
+            let tabCarried = if case .tab? = carrying { true } else { false }
+            if let carrying, (tabCarried || allowsPinned), local.y >= 0, local.y < tabsBoundary {
+                // A tab, a pinned page or a favorite can land among the pinned rows in this window: a gap, or a
+                // folder's row to go inside it. None is in this list's rows yet, so nothing is left out of the order.
+                let pinned = dragSnapshot(carrying: carrying, carried: [])
+                if let drop = pinned.drop(at: local) {
+                    resolved = drop
+                    pinnedSnapshot = pinned
+                    landing = (drop.section, drop.index, local.x)
+                }
+            } else if allowsPinned, local.y >= 0, local.y < tabsBoundary {
+                let (section, index) = target(at: local.y, allowsPinned: true, carried: [])
+                landing = (section, index, local.x)
+            } else if local.y >= 0 {
+                // Among the tabs, the tab snapshot is the one answer: its rows and the tab list give the gap, its
+                // level and the index the drop uses.
+                let tabs = tabSnapshot(moving: [], carried: [], kind: .page)
+                if let drop = tabs.drop(at: local, allowsOnto: false) {
+                    resolved = drop
+                    snapshot = tabs
+                    landing = (.tabs, drop.index, local.x)
+                } else {
+                    // No tab row to resolve against: fall back to the row count, which puts the line under New Tab.
+                    let (section, index) = target(at: local.y, allowsPinned: false, carried: [])
+                    landing = (section, index, local.x)
+                }
+            }
         }
-        guard landing?.section != external?.section || landing?.index != external?.index || landing?.pointX != external?.pointX else { return }
+        guard landing?.section != external?.section || landing?.index != external?.index || landing?.pointX != external?.pointX
+                || resolved != externalDrop else { return resolved }
         external = landing
+        externalDrop = resolved
+        externalSnapshot = snapshot
+        externalPinnedSnapshot = pinnedSnapshot
         placeLine()
+        return resolved
     }
 
     /// Where something from outside the list lands, at a point on screen, and the folder it goes into, if any.
     /// `carrying`: pinned pages it's carrying, which don't count where it lands.
     func dropTarget(at screenPoint: NSPoint, allowsPinned: Bool, carrying: Set<SidebarItem> = []) -> (section: Section, index: Int, folder: UUID?) {
+        // A tab from another window uses the one target its snapshot resolved for the line, not a second reading.
+        if !allowsPinned, let externalDrop, externalDrop.section == .tabs {
+            return (.tabs, externalDrop.index, nil)
+        }
         guard let window else { return (.tabs, 0, nil) }
         let point = convert(window.convertPoint(fromScreen: screenPoint), from: nil)
         let (section, index) = target(at: point.y, allowsPinned: allowsPinned, carried: carrying)
@@ -2309,6 +2361,29 @@ final class SidebarListView: NSView {
             hideLine()
             return
         }
+        // Over the pinned rows, a tab from another window reads the pinned snapshot: a gap draws its line, a folder
+        // row that takes it lights up and the line stays away.
+        if external.section == .bookmarks, let drop = externalDrop, let snapshot = externalPinnedSnapshot {
+            if case .onto(.folder(let id)) = drop.place {
+                hideLine()
+                showFolderTarget(id)
+                return
+            }
+            showFolderTarget(nil)
+            if let line = snapshot.line(for: drop, rowGap: rowGap) {
+                showLine(at: line.y, depth: line.depth)
+            } else {
+                hideLine()
+            }
+            return
+        }
+        // Among the tabs, the snapshot's own target draws the line: the same value the drop uses.
+        if external.section == .tabs, let drop = externalDrop, let snapshot = externalSnapshot,
+           let line = snapshot.line(for: drop, rowGap: rowGap) {
+            showFolderTarget(nil)
+            showLine(at: line.y, depth: line.depth)
+            return
+        }
         showFolderTarget(nil)
         let carried: Set<SidebarItem> = []
         let placed = withPlaceholder(items, section: external.section, index: external.index, carried: carried)
@@ -2482,15 +2557,40 @@ final class SidebarListView: NSView {
         let inWindow = Self.window(at: mouse) === window.windowController
 
         // Another window's list shows where a tab would land there; a pinned page can land among its pinned tabs too.
-        // Only where it would be taken: neither window private, as the drop itself asks (`listMoveToWindow`).
+        // Over its favorites grid, it takes the drop as a favorite there. Only where it would be taken: neither window
+        // private, as the drop itself asks.
         if let (controller, list) = hit, list !== self, drag.item.canBeFavorite,
            manager?.isPrivate == false, !controller.tabManager.isPrivate {
-            if externalTarget !== list { externalTarget?.externalHover(at: nil) }
-            externalTarget = list
-            list.externalHover(at: mouse, allowsPinned: { if case .bookmark = drag.item { true } else { false } }())
-        } else if externalTarget != nil {
+            let targetPoint = controller.window?.convertPoint(fromScreen: mouse) ?? .zero
+            let overTargetFavorites = !list.isPointInPinnedSection(targetPoint)
+                && controller.listDragOverFavorites(at: targetPoint, carrying: splitSide(of: drag.item))
+            if overTargetFavorites {
+                externalTarget?.externalHover(at: nil)
+                externalTarget = nil
+                drag.externalDrop = nil
+                drag.externalFavorite = controller
+                self.drag?.externalDrop = nil
+                self.drag?.externalFavorite = controller
+            } else {
+                if let previous = drag.externalFavorite, previous !== controller {
+                    previous.listDragOverFavorites(at: nil, carrying: nil)
+                }
+                drag.externalFavorite = nil
+                self.drag?.externalFavorite = nil
+                if externalTarget !== list { externalTarget?.externalHover(at: nil) }
+                externalTarget = list
+                let target = list.externalHover(at: mouse, allowsPinned: drag.item.canBeFavorite, carrying: drag.item)
+                drag.externalDrop = target
+                self.drag?.externalDrop = target
+            }
+        } else if externalTarget != nil || drag.externalFavorite != nil {
             externalTarget?.externalHover(at: nil)
             externalTarget = nil
+            drag.externalDrop = nil
+            drag.externalFavorite?.listDragOverFavorites(at: nil, carrying: nil)
+            drag.externalFavorite = nil
+            self.drag?.externalDrop = nil
+            self.drag?.externalFavorite = nil
         }
 
         // Over this window's favorites grid: a bar shows where it would go there, and the list's line goes. The pinned
@@ -2657,6 +2757,7 @@ final class SidebarListView: NSView {
     private func endDrag(released mouse: NSPoint?) {
         guard let drag else { return }
         let external = externalTarget
+        let externalFavorite = drag.externalFavorite
         self.drag = nil
         externalTarget = nil
         external?.externalHover(at: nil)
@@ -2682,6 +2783,7 @@ final class SidebarListView: NSView {
             if let manager, manager.currentSpaceID != drag.originSpace { delegate?.listSwitchSpaceDuringDrag(drag.originSpace) }
             landing = drag.view
         }
+        externalFavorite?.listDragOverFavorites(at: nil, carrying: nil)
         delegate?.listDropFinished()
         reload(animated: true)
         drag.view.isHidden = false
@@ -2697,6 +2799,14 @@ final class SidebarListView: NSView {
         guard let header = shownFrames[.header] else { return false }
         return windowPoint.y <= convert(header, to: nil).maxY
     }
+
+    /// Whether a point in this list's window is in the pinned section, at or below the space's name. A window carrying
+    /// something here asks before the favorites grid gets the point.
+    func isPointInPinnedSection(_ windowPoint: NSPoint) -> Bool { isInPinnedSection(windowPoint) }
+
+    /// The target the external line shows, for the window carrying the row: it lands at the same index and folder the
+    /// line drew, not at a second reading of the release point.
+    var externalDropTarget: SidebarDrop? { externalDrop }
 
     /// Drags the list along while the pointer comes near its top or bottom, before AppKit's own edge scroll starts: by
     /// the space's name the list is already moving, so the top of Pinned is easy to reach in a crowded section.
@@ -2751,6 +2861,13 @@ final class SidebarListView: NSView {
             }
         }
 
+        // Onto another window's favorites grid: that window makes it a favorite where its bar showed.
+        if let target = drag.externalFavorite, drag.item.canBeFavorite,
+           target.listDropOnFavorites([drag.item], dragged: drag.item) == true {
+            target.listDragOverFavorites(at: nil, carrying: nil)
+            return nil
+        }
+
         // Onto the favorites grid, picked rows and all. Above the space's name is the grid; the name and below are Pinned.
         let windowPoint = window?.convertPoint(fromScreen: mouse) ?? mouse
         if drag.item.canBeFavorite, drag.pinnable, !isInPinnedSection(windowPoint),
@@ -2768,13 +2885,28 @@ final class SidebarListView: NSView {
         // Picked tabs go along to another window; pinned pages are every window's already.
         let tabs = groupID != nil ? groupTabs : drag.together.compactMap { item -> Tab? in if case .tab(let id) = item { manager.tab(with: id) } else { nil } }
 
-        // Into another window's sidebar, where its line showed.
-        if let tab, let external, let (controller, list) = Self.list(at: mouse), list === external, controller.tabManager !== manager,
+        // Into another window's sidebar, where its line showed: the target that line came from, not a second reading
+        // of the release point. A tab that drifted a point at the end still lands where the line said.
+        if let tab, let externalList = external, let target = drag.externalDrop,
+           let controller = externalList.window?.windowController as? BrowserWindowController,
+           controller.tabManager !== manager {
+            if target.section == .bookmarks, let source = window?.windowController as? BrowserWindowController {
+                return controller.listPinTabToWindow(tab, from: source, at: target)
+            }
+            if target.section == .tabs,
+               delegate?.listMoveToWindow(tabs, controller: controller, index: target.index) == true {
+                return externalList.row(for: tab)
+            }
+        }
+        // Same, for a tab whose target has no tab rows to resolve: the old reading, as the line was drawn.
+        if let tab, let externalList = external, let (controller, list) = Self.list(at: mouse), list === externalList,
+           controller.tabManager !== manager,
            delegate?.listMoveToWindow(tabs, controller: controller, index: list.dropIndex(at: mouse)) == true {
             return list.row(for: tab)
         }
-        if case .bookmark(let id) = drag.item, let external, let (controller, list) = Self.list(at: mouse), list === external,
-           controller.tabManager !== manager, let landed = delegate?.listMovePinnedToWindow(id, controller: controller, at: mouse) {
+        if case .bookmark(let id) = drag.item, let externalList = external,
+           let (controller, list) = Self.list(at: mouse), list === externalList, controller.tabManager !== manager,
+           let landed = delegate?.listMovePinnedToWindow(id, controller: controller, to: drag.externalDrop, at: mouse) {
             return landed
         }
 

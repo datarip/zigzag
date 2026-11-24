@@ -379,7 +379,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
             let other = self.otherWindowForFavorite(at: point)
             if self.favoriteDropWindow !== other { self.favoriteDropWindow?.sidebar.list.externalHover(at: nil) }
             self.favoriteDropWindow = other
-            other?.sidebar.list.externalHover(at: point, allowsPinned: true)
+            other?.sidebar.list.externalHover(at: point, allowsPinned: true, carrying: .bookmark(favorite.id))
             // Over the pinned tiles, it would be pinned there (#539).
             let carrying = TabManager.SplitSide(kind: .favorite, inSplit: Library.shared.pinnedSplit(containing: favorite.id) != nil)
             let overTiles = self.dragOverPinnedTiles(at: other == nil ? window.convertPoint(fromScreen: point) : nil, carrying: carrying)
@@ -586,8 +586,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
     /// A favorite let go over this window's list: a pinned tab among the pinned ones (in a folder, if it's let go
     /// among a folder's pages), or a regular tab among the tabs, right where it was dropped. Returns its new row.
-    func dropFavorite(_ favorite: Bookmark, at screenPoint: NSPoint) -> NSView? {
-        let landing = sidebar.list.dropTarget(at: screenPoint, allowsPinned: true)
+    func dropFavorite(_ favorite: Bookmark, at screenPoint: NSPoint, to drop: SidebarDrop? = nil) -> NSView? {
+        // The target the other window's line showed, when it resolved one; else the old reading of the point.
+        let landing = drop.map { (section: $0.section, index: $0.index, folder: $0.folder) }
+            ?? sidebar.list.dropTarget(at: screenPoint, allowsPinned: true)
         let space = tabManager.currentSpaceID
         if landing.section == .bookmarks {
             pageChange(SavePath.saveName) {
@@ -603,7 +605,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
     /// A pinned page carried over from another window's list: its open pages come along (one already open here stays
     /// instead), it lands among the pinned tabs or the tabs right where it was dropped, and this window comes forward.
-    func takePinned(_ bookmarkID: UUID, from source: BrowserWindowController, at screenPoint: NSPoint) -> NSView? {
+    func takePinned(_ bookmarkID: UUID, from source: BrowserWindowController, to drop: SidebarDrop? = nil,
+                    at screenPoint: NSPoint) -> NSView? {
         let ids = Library.shared.pinnedSplit(containing: bookmarkID).map(\.ids) ?? [bookmarkID]
         // Sharing windows have the same pages (#162): nothing to bring over.
         for id in ids where source.tabManager.store !== tabManager.store {
@@ -613,7 +616,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
                 tabManager.insertBookmarkTab(live, bookmarkID: id)
             }
         }
-        let landing = sidebar.list.dropTarget(at: screenPoint, allowsPinned: true)
+        // The target that line came from, so the landing is where the line showed; the old reading is only for a
+        // pointer that resolved nowhere.
+        let landing = drop.map { (section: $0.section, index: $0.index, folder: $0.folder) }
+            ?? sidebar.list.dropTarget(at: screenPoint, allowsPinned: true)
         let space = tabManager.currentSpaceID
         window?.makeKeyAndOrderFront(nil)
         if landing.section == .bookmarks {
@@ -640,7 +646,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
                 tabManager.insertBookmarkTab(live, bookmarkID: id)
             }
         }
-        let row = dropFavorite(favorite, at: screenPoint)
+        let row = dropFavorite(favorite, at: screenPoint, to: sidebar.list.externalDropTarget)
         window?.makeKeyAndOrderFront(nil)
         return row
     }
@@ -4424,9 +4430,34 @@ extension BrowserWindowController: SidebarDelegate {
         return true
     }
 
-    func listMovePinnedToWindow(_ bookmarkID: UUID, controller: BrowserWindowController, at screenPoint: NSPoint) -> NSView? {
+    func listMovePinnedToWindow(_ bookmarkID: UUID, controller: BrowserWindowController, to drop: SidebarDrop?,
+                                at screenPoint: NSPoint) -> NSView? {
         guard !tabManager.isPrivate, !controller.tabManager.isPrivate else { return nil }
-        return controller.takePinned(bookmarkID, from: self, at: screenPoint)
+        return controller.takePinned(bookmarkID, from: self, to: drop, at: screenPoint)
+    }
+
+    /// A tab from another window dropped among this window's pinned rows: it becomes a pinned page here, at the gap or
+    /// in the folder the line showed. This window comes forward, and one undo takes the pin back.
+    func listPinTabToWindow(_ tab: Tab, from source: BrowserWindowController, at drop: SidebarDrop) -> NSView? {
+        guard !tabManager.isPrivate, !source.tabManager.isPrivate,
+              tabManager.canPin(tab, keepingGroup: false) else { return nil }
+        let space = tabManager.currentSpaceID
+        window?.makeKeyAndOrderFront(nil)
+        // Another window's own list: the tab comes here first, then pins. Shared windows already have it.
+        if tabManager.tab(with: tab.id) !== tab { source.move([tab], to: self, at: 0) }
+        confirmProfileCrossing([tab], to: space) { [weak self] in
+            guard let self else { return }
+            self.pageChange(String(localized: "Pin Tab", comment: "Undo action name, shown in the Edit menu as Undo Pin Tab.")) {
+                self.tabManager.bookmarkTab(tab, at: drop.index, in: space, keepingGroup: false)
+                guard let bookmarkID = tab.bookmarkID else { return }
+                if drop.folder != nil {
+                    // The one place transaction puts it in the folder and the folders beside it in their order.
+                    _ = Library.shared.movePinned(.bookmark(bookmarkID), to: drop, in: space)
+                }
+            }
+        }
+        guard let bookmarkID = tab.bookmarkID else { return nil }
+        return sidebar.list.row(forBookmark: bookmarkID)
     }
 
     func listSwitchSpaceDuringDrag(_ spaceID: UUID) {
