@@ -76,6 +76,8 @@ protocol SidebarListDelegate: AnyObject {
     /// Tabs dropped outside the window: onto another window's page, or anywhere else for a new one, in order. Returns
     /// true if handled.
     func listDropOutside(_ tabs: [Tab], at screenPoint: NSPoint) -> Bool
+    /// A tab dropped into another window's favorite grid. Returns true if handled.
+    func listFavoriteTabInWindow(_ tab: Tab, controller: BrowserWindowController) -> Bool
     /// Tabs dropped into another window's sidebar at an index, in order. Returns true if handled.
     func listMoveToWindow(_ tabs: [Tab], controller: BrowserWindowController, index: Int) -> Bool
     /// A pinned page dropped into another window's sidebar at a point on screen. Returns the row it landed as.
@@ -108,6 +110,7 @@ protocol SidebarListDelegate: AnyObject {
 }
 
 extension SidebarListDelegate {
+    func listFavoriteTabInWindow(_ tab: Tab, controller: BrowserWindowController) -> Bool { false }
     /// One row at a time: each method asks its own profile question. A window with several picked rows overrides this
     /// with one question for the lot.
     func listMovePickedToSpace(_ items: [SidebarItem], spaceID: UUID) {
@@ -3023,7 +3026,7 @@ final class SidebarListView: NSView {
                     }
                     springFolder = work
                     springFolderID = folderHit
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
                 }
             } else if springFolder != nil {
                 springFolder?.cancel()

@@ -137,7 +137,8 @@ final class FavoritesView: NSView {
             return TabManager.canSplit(carried, onto: TabManager.SplitSide(kind: kind, inSplit: !tile.partners.isEmpty))
         }
         let next: DropRegion
-        if let middle, let id = middle.bookmark?.id {
+        // A favorite card holds one page: its middle is never a split offer. Pinned cards still offer one.
+        if kind == .pinned, let middle, let id = middle.bookmark?.id {
             next = .tile(id, onRight: point.x > middle.frame.midX)
         } else {
             next = .gap(gap(at: point))
