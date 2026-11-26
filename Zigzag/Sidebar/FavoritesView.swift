@@ -219,7 +219,7 @@ final class FavoritesView: NSView {
 
     static var tileHeight: CGFloat { Tokens.Sidebar.favoriteHeight }
 
-    /// How many favorites to a row, a setting: 0 for as many as fit (`Sidebar.favoriteMinWidth`), or 2, 3 or 4.
+    /// How many favorites to a row, a setting: 0 for as many as fit (`Sidebar.favoriteMinWidth`), or 2 or 3.
     static var perRow: Int {
         get { UserDefaults.standard.integer(forKey: "FavoritesPerRow") }
         set {
@@ -228,26 +228,18 @@ final class FavoritesView: NSView {
         }
     }
     static let perRowChanged = Notification.Name("FavoritesPerRowChanged")
-    static let perRowChoices = [0, 2, 3, 4]
+    static let perRowChoices = [0, 2, 3]
 
     /// The columns a grid this wide has for this many favorites: the chosen count, or, on Automatic, rows that look
     /// whole. As few columns as fill every row, so tiles stay large; failing that, a last row of at least two, never
     /// one tile left on its own. Tiles may narrow from their comfortable width to their tightest for that: four at the
     /// usual width sit in one row rather than three and a lone one.
     static func columns(for width: CGFloat, count: Int) -> Int {
-        if perRow > 0 { return perRow }
+        if perRow > 0 { return min(perRow, Tokens.Sidebar.favoriteMaxColumns) }
         let gap = Tokens.Sidebar.favoriteGap
         func fitting(_ tile: CGFloat) -> Int { min(max(Int((width + gap) / (tile + gap)), 2), Tokens.Sidebar.favoriteMaxColumns) }
-        let roomy = fitting(Tokens.Sidebar.favoriteMinWidth), tight = max(roomy, fitting(Tokens.Sidebar.favoriteTightWidth))
-        guard count > roomy else { return roomy }
-        // As few rows as the width allows, then the fewest columns that keep that many rows, so rows come out even:
-        // six where four fit are 3 and 3, not 4 and 2.
-        let rows = (count + tight - 1) / tight
-        let even = max(2, (count + rows - 1) / rows)
-        if count % even != 1 { return even }
-        if let whole = (roomy...tight).first(where: { count % $0 == 0 }) { return whole }
-        // Then fewer, larger columns; when every count leaves one over (13 does), the roomy one.
-        return (roomy...tight).first { count % $0 != 1 } ?? (2..<roomy).reversed().first { count % $0 != 1 } ?? roomy
+        // Three cards at most in a row. The next card starts a new row.
+        return fitting(Tokens.Sidebar.favoriteMinWidth)
     }
 
     /// The setting changing: the tiles glide to their new rows and widths, and the sidebar makes room.

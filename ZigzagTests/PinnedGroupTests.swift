@@ -745,19 +745,19 @@ import Testing
         }
     }
 
-    /// The same for a favorite split of four: the other three stay side by side and the favorite opens all four again.
-    @Test(arguments: [0, 3]) func unloadingOneFavoritePageKeepsTheRestOnScreen(selected: Int) throws {
+    /// A favorite group of four is four cards, one page each. Unloading one leaves the other three.
+    @Test func aFavoriteGroupOfFourIsFourCards() throws {
         try inWindow((0..<4).map(String.init)) { controller, tabs, _ in
             let manager = controller.tabManager
             manager.makeGroup(tabs, shape: Self.shapes[4])
             manager.favoriteTab(tabs[0])
-            tabs.forEach { _ = $0.ensureWebView() }
-            manager.select(tabs[selected])
             let marks = tabs.compactMap(\.bookmarkID)
             #expect(marks.count == 4)
-            #expect(Library.shared.isFavorite(marks[0]))
+            #expect(marks.allSatisfy { Library.shared.isFavorite($0) })
+            #expect(Library.shared.favoriteSplits.isEmpty)
+            #expect(Library.shared.favoriteTiles(in: manager.profile.id).count == 4)
             controller.listClose(tabs[0])
-            expectRestOnScreen(manager, tabs: tabs, marks: marks)
+            #expect(marks.dropFirst().allSatisfy { Library.shared.isFavorite($0) })
         }
     }
 

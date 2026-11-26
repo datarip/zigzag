@@ -100,9 +100,9 @@ struct FavoriteTests {
     // The grid's width at the narrowest sidebar and at the usual one.
     let narrow: CGFloat = 204, usual: CGFloat = 228
 
-    @Test func fourSitInOneRow() {
-        #expect(FavoritesView.columns(for: narrow, count: 4) == 4)
-        #expect(FavoritesView.columns(for: usual, count: 4) == 4)
+    @Test func threeSitInOneRowAtMost() {
+        #expect(FavoritesView.columns(for: narrow, count: 4) == 3)
+        #expect(FavoritesView.columns(for: usual, count: 4) == 3)
     }
 
     @Test func fewerLargerTilesWhenRowsComeOutWhole() {
@@ -111,26 +111,19 @@ struct FavoriteTests {
         #expect(FavoritesView.columns(for: usual, count: 9) == 3)
     }
 
-    /// Rows come out even rather than a full one and a short one: six where four fit are 3 and 3, not 4 and 2. When
-    /// all of them fit in one row they stay in one.
-    @Test func rowsComeOutEven() {
-        for width in [usual, 240, 250, 260, 280] {
+    /// Three at most in a row. The next card starts a new row, even when that leaves one on the last row.
+    @Test func aFourthCardStartsANewRow() {
+        for width in [narrow, usual, 240, 250, 260, 280, 400] {
+            #expect(FavoritesView.columns(for: width, count: 4) == 3, "width \(width)")
+            #expect(FavoritesView.columns(for: width, count: 5) == 3, "width \(width)")
             #expect(FavoritesView.columns(for: width, count: 6) == 3, "width \(width)")
-            #expect(FavoritesView.columns(for: width, count: 7) == 4, "width \(width)")
-            #expect(FavoritesView.columns(for: width, count: 8) == 4, "width \(width)")
         }
-        #expect(FavoritesView.columns(for: 250, count: 5) == 3)
-        #expect(FavoritesView.columns(for: 400, count: 6) == 6)
     }
 
-    @Test func noLoneTileOnTheLastRow() {
+    @Test func neverMoreThanThreeInARow() {
         for count in 2...24 {
             for width in [narrow, usual, 260, 320, 400] {
-                let columns = FavoritesView.columns(for: width, count: count)
-                // Unless every count that fits leaves one over, as 13 does in a narrow sidebar.
-                let avoidable = (2...FavoritesView.columns(for: width, count: 1000)).contains { count % $0 != 1 }
-                guard count > columns, avoidable else { continue }
-                #expect(count % columns != 1, "\(count) favorites at \(width) leave one alone with \(columns) columns")
+                #expect(FavoritesView.columns(for: width, count: count) <= 3)
             }
         }
     }

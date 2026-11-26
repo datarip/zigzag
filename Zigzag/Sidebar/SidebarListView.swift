@@ -2072,7 +2072,7 @@ final class SidebarListView: NSView {
         guard manager?.isPrivate == false else { return nil }
         guard drag.snapshot.kind == .folder || point.y < tabsBoundary else { return nil }
         let interval = SidebarDragTiming.begin("pinnedDrop")
-        let drop = drag.snapshot.drop(at: point)
+        let drop = drag.snapshot.drop(at: point, grabbedAt: drag.grabX, grabDepth: drag.grabDepth)
         SidebarDragTiming.dropRan(interval.end())
         // A live folder fills itself: nothing lands inside one, and its own pages keep their order.
         if let folder = drop?.folder, Library.shared.folder(folder)?.live != nil { return nil }

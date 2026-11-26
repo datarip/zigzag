@@ -299,7 +299,7 @@ enum Tokens {
         static var favoriteMinWidth: CGFloat { scaled(56) }
         /// The narrowest a favorite gets so its row comes out whole instead of leaving one tile alone below.
         static var favoriteTightWidth: CGFloat { scaled(46) }
-        static let favoriteMaxColumns = 6
+        static let favoriteMaxColumns = 3
         static var favoriteHeight: CGFloat { scaledEven(36) }
         static var favoriteIcon: CGFloat { scaledEven(18) }
         static let favoriteGap: CGFloat = 6

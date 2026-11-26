@@ -967,6 +967,10 @@ enum DebugBridge {
             SidebarListView.setCollapsed(controller.tabManager.currentSpaceID, arg == "on")
             controller.tabManager.forgetClosedPins()
             controller.sidebar.list.reload(animated: false)
+        case "pinnedtiles":
+            // pinnedtiles on|off: Settings › Appearance › Pinned tabs as tiles, for a test copy.
+            SidebarView.pinnedTabsAsTiles = arg == "on"
+            debugLog("pinnedtiles (SidebarView.pinnedTabsAsTiles)")
         case "load": if let url = URL(string: arg) { controller.open(url, disposition: .currentTab) }
         case "sidebar": controller.toggleBrowserSidebar(nil)
         // newtabnote <path>: each new tab row out from the hidden sidebar (frame in window points, top left, and title),
@@ -3690,6 +3694,11 @@ enum DebugBridge {
             if let favorite = Library.shared.favorites.first(where: { $0.title == arg }) {
                 let owner = WindowManager.shared.controllers.first { $0.tabManager.bookmarkTab(for: favorite.id) != nil } ?? controller
                 owner.tabManager.unbookmark(favorite.id, toIndex: 0)
+            }
+        case "removefavorite":
+            // removefavorite <title>: the Remove from Favorites menu action, undoable.
+            if let favorite = Library.shared.favorites.first(where: { $0.title == arg }) {
+                controller.removeFavoriteWithUndo(favorite.id)
             }
         case "save": WindowManager.shared.saveNow(synchronously: true)
         default: break

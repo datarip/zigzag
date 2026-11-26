@@ -211,7 +211,7 @@ nonisolated struct DragSnapshot {
     ///
     /// It follows the plan's six steps. Find the gap, then let a folder row's middle take the drop whole. Work the level
     /// out from the pointer's x, and map that level to a folder. Work the index out, then say where the line goes.
-    func drop(at pointer: NSPoint) -> SidebarDrop? {
+    func drop(at pointer: NSPoint, grabbedAt: CGFloat? = nil, grabDepth: Int = 0) -> SidebarDrop? {
         // 0. Where the drop takes nothing: over a folder being carried and the rows inside it, at any point of that
         // block, and over the middle of a page's own row. The gaps above and below a page are still its own edges.
         if takesNothing(at: pointer) { return nil }
@@ -254,17 +254,41 @@ nonisolated struct DragSnapshot {
 
         // 3. Above or below a row is that row's own level. There is no stepping by the pointer's x: a folder is entered
         // by its row's middle only, so the line and the drop cannot disagree about the level.
-        var level: Int
+        var level = 0
         var parent: UUID?
-        if let hit {
-            level = hit.depth
-            parent = parentOnTheWay(to: hit.item)
-        } else if let rawBelow {
-            level = rawBelow.depth
-            parent = parentOnTheWay(to: rawBelow.item)
-        } else {
-            level = anchor.depth
-            parent = parentOnTheWay(to: anchor.item)
+        // The gap below the last page inside an open folder is the one pinned boundary gap. Short of half a step
+        // the drop stays outside the folder, after its whole block. Past it the page goes inside, after the folder's
+        // last page. Without a pick-up point, or at any other gap, the row sets the level.
+        var boundaryGap = false
+        let aboveIndex = boundary - 1
+        if aboveIndex >= 0, pointer.y > rows[aboveIndex].frame.midY,
+           case .bookmark(let id) = rows[aboveIndex].item, let folder = pageFolder[id] {
+            // The last page inside its open folder, with the gap below it outside the folder or at the end.
+            let lastInside = !rows[(aboveIndex + 1)...].contains { isInside($0.item, folder: folder) }
+            if lastInside, let grabbedAt {
+                let inside = rows[aboveIndex].depth
+                let x = SidebarListView.nestX(pointer: pointer.x, grabbedAt: grabbedAt, depth: grabDepth)
+                if SidebarListView.setsIn(x, depth: inside) {
+                    level = inside
+                    parent = folder
+                } else {
+                    level = folderDepth[folder] ?? 0
+                    parent = folderParent[folder]
+                }
+                boundaryGap = true
+            }
+        }
+        if !boundaryGap {
+            if let hit {
+                level = hit.depth
+                parent = parentOnTheWay(to: hit.item)
+            } else if let rawBelow {
+                level = rawBelow.depth
+                parent = parentOnTheWay(to: rawBelow.item)
+            } else {
+                level = anchor.depth
+                parent = parentOnTheWay(to: anchor.item)
+            }
         }
         // Never into the folder being carried, nor into one inside it. The drop climbs out to the nearest folder that
         // may take it, and the line shows the level it really lands at.
@@ -328,6 +352,22 @@ nonisolated struct DragSnapshot {
         var at = max(index, 0)
         while at < rows.count, carried.contains(rows[at].item) { at += 1 }
         return at < rows.count ? rows[at] : nil
+    }
+
+    /// Whether a row is inside a folder at any depth.
+    private func isInside(_ item: SidebarItem, folder: UUID) -> Bool {
+        var next: UUID?
+        switch item {
+        case .bookmark(let id): next = pageFolder[id]
+        case .folder(let id): next = folderParent[id]
+        default: return false
+        }
+        var seen: Set<UUID> = []
+        while let id = next, seen.insert(id).inserted {
+            if id == folder { return true }
+            next = folderParent[id]
+        }
+        return false
     }
 
     /// The folder a row sits in: a page's folder, or a folder's parent. Nil is the top level.

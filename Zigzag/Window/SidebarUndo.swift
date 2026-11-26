@@ -261,10 +261,10 @@ extension BrowserWindowController {
         pageChange(String(localized: "Add to Favorites", comment: "Undo action name, shown in the Edit menu as Undo Add to Favorites.")) { [tabManager] in tabManager.favoriteTab(tab, at: index) }
     }
 
-    /// A tab or pinned page dropped on a favorite's middle: the two become one favorite, side by side.
+    /// A tab or pinned page dropped on a favorite's middle: the page becomes its own favorite card, next to it.
     func joinFavoriteWithUndo(_ tab: Tab, onto favoriteID: UUID, onRight: Bool) {
         guard tabManager.canPin(tab, keepingGroup: false) else { return }
-        pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [tabManager] in tabManager.joinFavorite(tab, onto: favoriteID, onRight: onRight) }
+        pageChange(String(localized: "Add to Favorites", comment: "Undo action name, shown in the Edit menu as Undo Add to Favorites.")) { [tabManager] in tabManager.joinFavorite(tab, onto: favoriteID, onRight: onRight) }
     }
 
     /// A favorite back to a regular tab in a space's list (nil: the space you're in).
@@ -272,12 +272,18 @@ extension BrowserWindowController {
         pageChange(String(localized: "Move to Tabs", comment: "Undo action name, shown in the Edit menu as Undo Move to Tabs.")) { [tabManager] in tabManager.unbookmark(id, toIndex: index, in: spaceID) }
     }
 
+    /// Remove from Favorites: the page goes back to its old pinned place, or to the first regular tab. One undo.
     func removeFavoriteWithUndo(_ id: UUID) {
-        // A split favorite goes as one: both its pages.
-        let ids = Library.shared.pinnedSplit(containing: id).map(\.ids) ?? [id]
-        libraryChange(String(localized: "Remove from Favorites", comment: "Undo action name, shown in the Edit menu as Undo Remove from Favorites.")) {
-            for id in ids { if let live = tabManager.bookmarkTab(for: id) { tabManager.close(live) } }
-            Library.shared.removeBookmarks(ids)
+        let name = String(localized: "Remove from Favorites", comment: "Undo action name, shown in the Edit menu as Undo Remove from Favorites.")
+        if let origin = Library.shared.bookmark(id)?.pinnedOrigin, Library.shared.index(of: origin.spaceID) != nil {
+            pageChange(name) {
+                Library.shared.pinFavorite(id, in: origin.spaceID, at: origin.index)
+                Library.shared.moveBookmark(id, to: origin.index, in: origin.spaceID, folder: .some(origin.folderID))
+            }
+            return
+        }
+        pageChange(name) { [tabManager] in
+            tabManager.unbookmark(id, toIndex: 0)
         }
     }
 

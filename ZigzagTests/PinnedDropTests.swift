@@ -140,9 +140,11 @@ struct PinnedDropFixture {
         return pages.map(\.id).filter { !moving.contains($0) }
     }
 
-    /// The resolver's answer for `item` picked up and the pointer at `point`.
-    func drop(_ point: NSPoint, carrying item: SidebarItem) -> SidebarDrop? {
-        snapshot(carrying: item).drop(at: point)
+    /// The resolver's answer for `item` picked up and the pointer at `point`. `grabbedAt` is where it was picked
+    /// up, for the one pinned boundary gap at the end of an open folder.
+    func drop(_ point: NSPoint, carrying item: SidebarItem, grabbedAt: CGFloat? = nil,
+              grabDepth: Int = 0) -> SidebarDrop? {
+        snapshot(carrying: item).drop(at: point, grabbedAt: grabbedAt, grabDepth: grabDepth)
     }
 
     /// The snapshot a drag of `item` resolves against: the rows on show, the pages left without the ones that leave, and
@@ -599,6 +601,29 @@ struct PinnedDropTests {
         let above = tree.snapshot(carrying: reading)
         let firstPlace = try #require(above.place(of: .folder(first)))
         #expect(firstPlace < -1.5)
+    }
+
+    /// Work dropped below open Reading at the end of the list: left of half a step it lands after Reading's whole
+    /// block at the top level. Right of it, it goes after R12 inside Reading. The line length follows the level.
+    @Test func workBelowOpenReadingAtTheEndPicksOutsideOrInside() throws {
+        let tree = PinnedDropFixture.standard()
+        let work = SidebarItem.folder(try tree.folderID("Work"))
+        let reading = try tree.folderID("Reading")
+        let r12 = SidebarItem.bookmark(try tree.pageID("R12"))
+        let shut = SidebarItem.folder(try tree.folderID("Shut"))
+        let half = SidebarListView.folderIndent / 2
+        let outside = try #require(tree.drop(tree.point(in: r12, .below, x: 0), carrying: work, grabbedAt: 0))
+        #expect(outside.folder == nil)
+        #expect(outside.place == .gap(above: r12, below: shut, depth: 0))
+        let inside = try #require(tree.drop(tree.point(in: r12, .below, x: SidebarListView.indent(depth: 1) - half + 1),
+                                           carrying: work, grabbedAt: 0))
+        #expect(inside.folder == reading)
+        #expect(inside.place == .gap(above: r12, below: shut, depth: 1))
+        let shown = tree.snapshot(carrying: work)
+        let outLine = try #require(shown.line(for: outside, rowGap: Tokens.Sidebar.rowGap))
+        let inLine = try #require(shown.line(for: inside, rowGap: Tokens.Sidebar.rowGap))
+        #expect(outLine.depth == 0 && inLine.depth == 1)
+        #expect(abs(outLine.y - inLine.y) <= Tokens.Sidebar.rowGap)
     }
 
 }

@@ -1425,6 +1425,8 @@ final class TabManager {
             result = tab
         }
         Library.shared.removeBookmark(bookmarkID)
+        // A live folder keeps its own page: its copy goes back after this one leaves.
+        Library.shared.replenishLive(in: space)
         return result
     }
 

@@ -1,11 +1,20 @@
 import AppKit
 
+/// Where a favorite was pinned before it was favorited, so removing it from Favorites can put it back.
+struct PinnedOrigin: Codable, Equatable {
+    var spaceID: UUID
+    var folderID: UUID?
+    var index: Int
+}
+
 struct Bookmark: Codable, Identifiable, Equatable {
     var id = UUID()
     var url: URL
     var title: String
     /// Drawn instead of its site's icon: an SF Symbol's name, or an emoji. Nil: its site's (and older libraries).
     var icon: String? = nil
+    /// A favorite that was pinned before it was favorited: where it came from. Nil for a favorite made from a tab.
+    var pinnedOrigin: PinnedOrigin? = nil
 
     /// Chosen icon, else the site's set icon (`SiteIcons`), else its favicon.
     var displayIcon: NSImage? { (icon ?? SiteIcons.icon(for: url)).map(IconChoice.pageIcon) ?? FaviconStore.shared.cachedIcon(for: url) }
@@ -1110,9 +1119,13 @@ final class Library {
     func addFavoriteSplit(_ marks: [Bookmark], as layout: PinnedSplit, at slot: Int? = nil, in profile: UUID) {
         let ids = marks.map(\.id)
         guard ids == layout.ids else { return }
+        // One page per favorite card: a split's pages become separate cards, in their order.
         favoriteSplits.removeAll { split in ids.contains(where: split.contains) }
-        arrangeFavorites(Self.placing(ids, atSlot: slot, in: favorites(in: profile).map(\.id), splits: favoriteSplits), adding: marks, in: profile)
-        favoriteSplits.append(layout)
+        var place = slot
+        for mark in marks {
+            arrangeFavorites(Self.placing([mark.id], atSlot: place, in: favorites(in: profile).map(\.id), splits: []), adding: [mark], in: profile)
+            place = place.map { $0 + 1 }
+        }
         tidyFavorites()
         commit()
     }
@@ -1121,11 +1134,10 @@ final class Library {
     /// that favorite's tile is, the page on the right or the left. The page is then that favorite's profile's.
     func joinFavorite(_ page: Bookmark, onto targetID: UUID, onRight: Bool) {
         guard let target = favorites.first(where: { $0.id == targetID }), page.id != targetID else { return }
-        let (left, right) = onRight ? (target, page) : (page, target)
         let profile = profileID(ofFavorite: targetID)
-        favoriteSplits.removeAll { $0.contains(left.id) || $0.contains(right.id) }
-        arrangeFavorites(Self.placing([left.id, right.id], at: targetID, in: favorites(in: profile).map(\.id)), adding: [page], in: profile)
-        favoriteSplits.append(PinnedSplit(left: left.id, right: right.id))
+        // One page per favorite card: the page joins the grid next to the target, as its own card.
+        let slot = favorites(in: profile).firstIndex { $0.id == target.id } ?? favorites(in: profile).count
+        arrangeFavorites(Self.placing([page.id], atSlot: onRight ? slot + 1 : slot, in: favorites(in: profile).map(\.id), splits: []), adding: [page], in: profile)
         tidyFavorites()
         commit()
     }
@@ -1176,8 +1188,12 @@ final class Library {
     /// Turns a space bookmark into a favorite at a tile's place (nil: the end), keeping its id (and so its live page).
     /// A page of a pinned split or group brings the rest: they stay one split, now a favorite.
     func makeFavorite(_ bookmarkID: UUID, at slot: Int? = nil, in profile: UUID) {
-        guard let bookmark = bookmark(bookmarkID), !isFavorite(bookmarkID) else { return }
-        if let pinned = pinnedSplit(containing: bookmarkID), case let marks = pinned.ids.compactMap(self.bookmark), marks.count == pinned.ids.count {
+        guard var bookmark = bookmark(bookmarkID), !isFavorite(bookmarkID) else { return }
+        // A pinned page remembers where it was, so Remove from Favorites can put it back.
+        bookmark.pinnedOrigin = pinnedOrigin(of: bookmarkID)
+        if let pinned = pinnedSplit(containing: bookmarkID), case let stored = pinned.ids.compactMap(self.bookmark), stored.count == pinned.ids.count {
+            var marks = stored
+            for index in marks.indices { marks[index].pinnedOrigin = pinnedOrigin(of: marks[index].id) }
             for s in spaces.indices {
                 removePages(pinned.ids, at: s)
                 spaces[s].pinnedSplits?.removeAll { $0.contains(bookmarkID) }
@@ -1201,8 +1217,9 @@ final class Library {
         guard let s = self.index(of: spaceID) else { return }
         let pair = favoriteSplits.first { $0.contains(id) }
         let ids = pair.map(\.ids) ?? [id]
-        let moving = favorites.filter { ids.contains($0.id) }
+        var moving = favorites.filter { ids.contains($0.id) }
         guard !moving.isEmpty else { return }
+        for index in moving.indices { moving[index].pinnedOrigin = nil }
         favorites.removeAll { ids.contains($0.id) }
         favoriteSplits.removeAll { $0.contains(id) }
         for id in ids { directory.assign(favorite: id, to: Profile.defaultID) }
@@ -1212,6 +1229,13 @@ final class Library {
         commit()
     }
 
+    /// Where a pinned page sits now: its space, folder and index. Nil when it is not pinned.
+    private func pinnedOrigin(of id: UUID) -> PinnedOrigin? {
+        guard let space = spaceID(ofBookmark: id), let s = index(of: space),
+              let index = spaces[s].bookmarks.firstIndex(where: { $0.id == id }) else { return nil }
+        return PinnedOrigin(spaceID: space, folderID: folderID(containing: id), index: index)
+    }
+
     /// Takes a pinned page out of its space, to become a favorite; the caller commits.
     func detachBookmark(_ id: UUID) -> Bookmark? {
         guard let bookmark = spaces.lazy.compactMap({ $0.bookmarks.first { $0.id == id } }).first else { return nil }
@@ -1219,9 +1243,9 @@ final class Library {
         return bookmark
     }
 
-    /// Each favorite split keeps different favorites, in no other split, each of its pages just after the one before.
+    /// A favorite card holds one page. Older libraries may keep split favorites: they come back as one card per page.
     private func tidyFavorites() {
-        (favorites, favoriteSplits) = Self.tidied(favorites, splits: favoriteSplits, directory: directory)
+        (favorites, favoriteSplits) = Self.tidied(favorites, splits: [], directory: directory)
     }
 
     /// The favorites and their splits as they may be kept: each split different favorites of one profile, in no
@@ -1515,6 +1539,8 @@ final class Library {
         guard pages.count == spaces[s].bookmarks.count else { return false }
         spaces[s].bookmarks = pages
         spaces[s].folders = moved.folders.isEmpty ? nil : moved.folders
+        // A live folder keeps its own page: it fills the place this one left.
+        keepLive(s)
         commit()
         return true
     }
@@ -1532,8 +1558,16 @@ final class Library {
         guard pages.count == spaces[s].bookmarks.count else { return false }
         spaces[s].bookmarks = pages
         spaces[s].folders = moved.folders.isEmpty ? nil : moved.folders
+        keepLive(s)
         commit()
         return true
+    }
+
+    /// Fills a live folder's place after a page left it.
+    func replenishLive(in spaceID: UUID) {
+        guard let s = index(of: spaceID) else { return }
+        tidyFolders(s)
+        commit()
     }
 
     // MARK: Folders

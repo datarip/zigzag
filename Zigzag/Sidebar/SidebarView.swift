@@ -1187,7 +1187,8 @@ final class SidebarView: NSView {
     /// Columns both grids use while each has tiles: as for all of them, no more than the larger group fills.
     static func sharedColumns(width: CGFloat, favorites: Int, pinned: Int) -> Int? {
         guard favorites > 0, pinned > 0 else { return nil }
-        return max(2, min(FavoritesView.columns(for: width, count: favorites + pinned), max(favorites, pinned)))
+        let columns = FavoritesView.columns(for: width, count: favorites + pinned)
+        return max(2, min(columns, Tokens.Sidebar.favoriteMaxColumns, max(favorites, pinned)))
     }
 
     /// Settings › Appearance › Double-click the sidebar for a new tab. On by default.
