@@ -278,17 +278,14 @@ final class NumberHints {
 
     func show(force: Bool = false) {
         guard let controller, force || canShow(focused: true) else { return }
-        // The pinned tiles (#539) count after the favorites, as they show.
-        let favorites = Library.shared.favoriteTiles(in: controller.tabManager.profile.id).map(\.0.id) + controller.sidebar.pinnedTiles.tileIDs
-        let rows = controller.sidebar.list.pageRows
-        let labels = TabNumbers.labels(count: favorites.count + rows.count)
-        var tileNumbers: [UUID: Int] = [:]
-        for (i, id) in favorites.enumerated() { if let n = labels[i] { tileNumbers[id] = n } }
-        var rowNumbers: [SidebarItem: Int] = [:]
-        for (i, item) in rows.enumerated() { if let n = labels[favorites.count + i] { rowNumbers[item] = n } }
-        controller.sidebar.favorites.showNumbers(tileNumbers)
-        controller.sidebar.pinnedTiles.showNumbers(tileNumbers)
-        controller.sidebar.list.showNumbers(rowNumbers)
+        // Numbers belong to the favorites only: pinned cards, folders, pinned rows and tabs show none.
+        let favorites = Library.shared.favoriteTiles(in: controller.tabManager.profile.id).map(\.0.id)
+        let labels = TabNumbers.labels(count: favorites.count)
+        var numbers: [UUID: Int] = [:]
+        for (i, id) in favorites.enumerated() { if let n = labels[i] { numbers[id] = n } }
+        controller.sidebar.favorites.showNumbers(numbers)
+        controller.sidebar.pinnedTiles.showNumbers([:])
+        controller.sidebar.list.showNumbers([:])
         isShown = true
     }
 

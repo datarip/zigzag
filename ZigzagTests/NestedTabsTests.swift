@@ -152,22 +152,36 @@ struct NestedTabsTests {
         let a1a = SidebarItem.tab(try tree.tabID("A1a"))
         let b = SidebarItem.tab(try tree.tabID("B"))
         let half = SidebarListView.folderIndent / 2
-        // An ordinary gap keeps the row's level wherever the pointer is across: above A1 and above A1a.
-        for gap in [a1, a1a] {
-            let left = try #require(tree.drop(try tree.point(in: gap, .above, x: 0), carrying: c, grabbedAt: 0))
-            let right = try #require(tree.drop(try tree.point(in: gap, .above, x: 200), carrying: c, grabbedAt: 0))
-            #expect(left.place == right.place)
-            #expect(left.folder == right.folder)
-        }
-        // The last row inside A1 is a boundary: short of half a step it lands after A, past it inside A1.
-        let outside = try #require(tree.drop(try tree.point(in: a1a, .below, x: SidebarListView.indent(depth: 2) - half - 1),
+        // Above A1: the row below is its first child, so the gap is inside A at the child's level.
+        let aID = try tree.tabID("A")
+        let aboveA1Left = try #require(tree.drop(try tree.point(in: a1, .above, x: 0), carrying: c, grabbedAt: 0))
+        let aboveA1Right = try #require(tree.drop(try tree.point(in: a1, .above, x: 200), carrying: c, grabbedAt: 0))
+        #expect(aboveA1Left.place == .gap(above: .tab(aID), below: a1, depth: 1))
+        #expect(aboveA1Left.folder == aID)
+        #expect(aboveA1Right == aboveA1Left)
+        // Above A1a: the same row, one level deeper.
+        let aboveA1aPlain = try #require(tree.drop(try tree.point(in: a1a, .above, x: 0), carrying: c, grabbedAt: 0))
+        let aboveA1aNested = try #require(tree.drop(try tree.point(in: a1a, .above, x: 200), carrying: c, grabbedAt: 0))
+        #expect(aboveA1aPlain.place == .gap(above: a1, below: a1a, depth: 2))
+        #expect(aboveA1aPlain.folder == a1ID)
+        #expect(aboveA1aNested == aboveA1aPlain)
+        // An ordinary seam: above B, short of the step is top level, set in past it goes under A1.
+        let ordinaryLeft = try #require(tree.drop(try tree.point(in: b, .above, x: 0), carrying: c, grabbedAt: 0))
+        let ordinaryRight = try #require(tree.drop(try tree.point(in: b, .above, x: 200), carrying: c, grabbedAt: 0))
+        #expect(ordinaryLeft.place == .gap(above: a1a, below: b, depth: 0))
+        #expect(ordinaryLeft.folder == nil)
+        #expect(ordinaryRight.place == .gap(above: a1a, below: b, depth: 2))
+        #expect(ordinaryRight.folder == a1ID)
+        // Below A1a the pointer picks the ancestor it is set in under, then A1 itself.
+        let outside = try #require(tree.drop(try tree.point(in: a1a, .below, x: SidebarListView.indent(depth: 1)),
                                              carrying: c, grabbedAt: 0))
-        #expect(outside.place == .gap(above: a1a, below: b, depth: 0))
+        #expect(outside.place == .gap(above: a1a, below: b, depth: 1))
+        #expect(outside.folder == aID)
         let inside = try #require(tree.drop(try tree.point(in: a1a, .below, x: SidebarListView.indent(depth: 2) - half + 1),
                                             carrying: c, grabbedAt: 0))
         #expect(inside.place == .gap(above: a1a, below: b, depth: 2))
         #expect(inside.folder == a1ID)
-        // A row with no children is the other boundary: after it, or its first child.
+        // A row with no children: after it, or its first child.
         let endOutside = try #require(tree.drop(try tree.point(in: c, .below, x: 0), carrying: SidebarItem.tab(try tree.tabID("B")),
                                                 grabbedAt: 0))
         let endInside = try #require(tree.drop(try tree.point(in: c, .below, x: SidebarListView.indent(depth: 1) + 1),

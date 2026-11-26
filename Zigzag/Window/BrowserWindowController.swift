@@ -402,7 +402,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
             // Over this window's pinned tiles, it would be pinned there (#539).
             let overTiles = self.dragOverPinnedTiles(at: other == nil ? window.convertPoint(fromScreen: point) : nil, carrying: carrying)
             let over = other == nil && !overTiles && !self.tabManager.isPrivate && self.isOverList(point)
-            self.sidebar.list.externalHover(at: over ? point : nil, allowsPinned: true)
+            self.sidebar.list.externalHover(at: over ? point : nil, allowsPinned: true, carrying: .bookmark(favorite.id))
             self.favoriteSpring(at: other == nil ? window.convertPoint(fromScreen: point) : nil)
             self.sidebar.list.carryToEdge(at: other == nil ? point : nil)
             return over || other != nil
@@ -614,8 +614,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         // The target the line showed, when one was resolved; else this list's resolver at the release point.
         let resolved = drop ?? sidebar.list.externalDropTarget
             ?? sidebar.list.externalHover(at: screenPoint, allowsPinned: true, carrying: .bookmark(favorite.id))
-        let landing = resolved.map { (section: $0.section, index: $0.index, folder: $0.folder) }
-            ?? sidebar.list.dropTarget(at: screenPoint, allowsPinned: true)
+        guard let resolved else { return nil }
+        let landing = (section: resolved.section, index: resolved.index, folder: resolved.folder)
         let space = tabManager.currentSpaceID
         if landing.section == .bookmarks {
             pageChange(SavePath.saveName) {
@@ -635,10 +635,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
                     at screenPoint: NSPoint) -> NSView? {
         guard !tabManager.isPrivate, !source.tabManager.isPrivate else { return nil }
         let ids = Library.shared.pinnedSplit(containing: bookmarkID).map(\.ids) ?? [bookmarkID]
-        // The target that line came from, so the landing is where the line showed; the old reading is only for a
-        // pointer that resolved nowhere.
-        let landing = drop.map { (section: $0.section, index: $0.index, folder: $0.folder) }
-            ?? sidebar.list.dropTarget(at: screenPoint, allowsPinned: true)
+        // The card grids the line showed are read before the profile question can clear them.
+        let overFavorites = sidebar.favorites.isDropTarget
+        let overPinnedTiles = sidebar.pinnedTiles.isDropTarget
+        // The target that line came from, so the landing is where the line showed.
+        let resolved = drop ?? sidebar.list.externalDropTarget
+        guard resolved != nil || overFavorites || overPinnedTiles else { return nil }
+        let landing = resolved.map { (section: $0.section, index: $0.index, folder: $0.folder) }
+            ?? (section: SidebarListView.Section.bookmarks, index: 0, folder: UUID?.none)
         let space = tabManager.currentSpaceID
         window?.makeKeyAndOrderFront(nil)
         // A pinned page whose page is open carries that page across profiles, so it asks the question a tab asks. The
@@ -655,13 +659,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
                     self.tabManager.insertBookmarkTab(live, bookmarkID: id)
                 }
             }
-            // Another window's card grids take it at the line they showed.
-            if self.sidebar.favorites.isDropTarget {
-                self.sidebar.favorites.isDropTarget = false
+            // Another window's card grids take it at the line they showed. The grid keeps its target lit until
+            // `listDropOnFavorites` reads it and clears it.
+            if overFavorites {
                 _ = self.listDropOnFavorites([.bookmark(bookmarkID)], dragged: .bookmark(bookmarkID))
                 return
             }
-            if self.sidebar.pinnedTiles.isDropTarget {
+            if overPinnedTiles {
                 _ = self.dropOnPinnedTiles([.bookmark(bookmarkID)], dragged: .bookmark(bookmarkID))
                 return
             }
@@ -884,11 +888,28 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         return true
     }
 
+    /// A regular tab dropped into this window's pinned-card grid: it moves here and is pinned at the bar's slot.
+    func listPinTabInWindowToTiles(_ tab: Tab, from source: BrowserWindowController) -> Bool {
+        guard !tabManager.isPrivate, !source.tabManager.isPrivate,
+              tabManager.canPin(tab, keepingGroup: false), sidebar.pinnedTiles.isDropTarget else { return false }
+        let space = tabManager.currentSpaceID
+        let index = pinnedIndex(forTile: sidebar.pinnedTiles.dropIndex, moving: [])
+        window?.makeKeyAndOrderFront(nil)
+        if tabManager.tab(with: tab.id) !== tab { source.move([tab], to: self, at: 0) }
+        pageChange(String(localized: "Pin Tab", comment: "Undo action name, shown in the Edit menu as Undo Pin Tab.")) {
+            self.tabManager.bookmarkTab(tab, at: index, in: space, keepingGroup: false)
+        }
+        return true
+    }
+
     /// A favorite carried over from another window's Favorites: its open pages come along (one already open here
     /// stays instead), it lands as it would from this window's own, and this window comes forward.
     func takeFavorite(_ favorite: Bookmark, from source: BrowserWindowController, at screenPoint: NSPoint) -> NSView? {
         guard !tabManager.isPrivate, !source.tabManager.isPrivate else { return nil }
         let ids = Library.shared.favoriteSplits.first { $0.contains(favorite.id) }.map(\.ids) ?? [favorite.id]
+        // The card grids the line showed are read before the profile question can clear them.
+        let overFavorites = sidebar.favorites.isDropTarget
+        let overPinnedTiles = sidebar.pinnedTiles.isDropTarget
         let space = tabManager.currentSpaceID
         window?.makeKeyAndOrderFront(nil)
         let open = openPages(ids, from: source)
@@ -902,7 +923,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
                 }
             }
             // Another window's card grids take it at the line they showed.
-            if self.sidebar.favorites.isDropTarget {
+            if overFavorites {
                 let index = self.sidebar.favorites.dropIndex
                     ?? Library.shared.favoriteTiles(in: self.tabManager.profile.id).count
                 self.sidebar.favorites.isDropTarget = false
@@ -911,7 +932,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
                 }
                 return
             }
-            if self.sidebar.pinnedTiles.isDropTarget {
+            if overPinnedTiles {
                 _ = self.dropFavoriteOnPinnedTiles(favorite)
                 return
             }
@@ -5336,13 +5357,13 @@ extension BrowserWindowController {
         let carrying = TabManager.SplitSide(kind: .pinned, inSplit: Library.shared.pinnedSplit(containing: page.id) != nil)
         let overCards = other?.hoverCardTargets(at: point, carrying: carrying) ?? false
         if !overCards {
-            other?.sidebar.list.externalHover(at: point, allowsPinned: true)
+            other?.sidebar.list.externalHover(at: point, allowsPinned: true, carrying: .bookmark(page.id))
         } else {
             other?.sidebar.list.externalHover(at: nil)
         }
         let overFavorites = dragOverFavoritesGrid(at: other == nil ? local : nil, carrying: carrying)
         let over = other == nil && !overFavorites && isOverList(point)
-        sidebar.list.externalHover(at: over ? point : nil, allowsPinned: true)
+        sidebar.list.externalHover(at: over ? point : nil, allowsPinned: true, carrying: .bookmark(page.id))
         favoriteSpring(at: other == nil ? local : nil)
         sidebar.list.carryToEdge(at: other == nil ? point : nil)
         return over || other != nil
@@ -5362,15 +5383,16 @@ extension BrowserWindowController {
         }
         guard isOverList(point) else { return (false, nil) }
         // The same resolver the row line and the drop read, so the card lands at the line.
-        let resolved = sidebar.list.externalDropTarget
-            ?? sidebar.list.externalHover(at: point, allowsPinned: true, carrying: .bookmark(page.id))
-        let landing = resolved.map { (section: $0.section, index: $0.index, folder: $0.folder) }
-            ?? sidebar.list.dropTarget(at: point, allowsPinned: true, carrying: [.bookmark(page.id)])
-        // A card let go inside a pinned folder is demoted to a row there. A card let go as a lone card in the
-        // pinned tree stays where it is: cards are not rows.
+        guard let resolved = sidebar.list.externalDropTarget
+                ?? sidebar.list.externalHover(at: point, allowsPinned: true, carrying: .bookmark(page.id)) else {
+            return (false, nil)
+        }
+        let landing = (section: resolved.section, index: resolved.index, folder: resolved.folder)
+        // A card let go inside a pinned folder is demoted to a row there, at any seam. A card let go as a lone card
+        // in the pinned tree stays a card: only a folder's place makes it a row.
         if landing.section == .bookmarks {
-            let insideFolder: Bool = if case .onto(.folder)? = resolved?.place { true } else { resolved?.folder != nil }
-            if let resolved, insideFolder {
+            let insideFolder: Bool = if case .onto(.folder) = resolved.place { true } else { resolved.folder != nil }
+            if insideFolder {
                 listMovePinned(.bookmark(page.id), to: resolved, in: tabManager.currentSpaceID)
                 return (true, sidebar.list.row(forBookmark: page.id))
             }

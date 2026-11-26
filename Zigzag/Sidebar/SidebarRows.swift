@@ -1661,6 +1661,31 @@ final class FolderRowView: SidebarRowView, NSTextFieldDelegate {
         chevron.alphaValue = isHovered || !isOpen || isDropTarget ? 1 : 0.6
     }
 
+    /// A shut folder that a drag rests on flashes twice, so the wait before it opens is seen.
+    func flashDropTarget() {
+        guard isDropTarget, window != nil, !Tokens.Motion.reduceMotion, let layer else { return }
+        let base = cgColor(Tokens.Color.accent.withAlphaComponent(Tokens.Color.dropAlpha))
+        let bright = cgColor(Tokens.Color.accent.withAlphaComponent(Tokens.Color.dropEdgeAlpha))
+        for pulse in 0..<2 {
+            let flash = CABasicAnimation(keyPath: "backgroundColor")
+            flash.fromValue = base
+            flash.toValue = bright
+            flash.duration = Tokens.Motion.state
+            flash.autoreverses = true
+            flash.beginTime = CACurrentMediaTime() + Double(pulse) * Tokens.Motion.state * 2
+            flash.timingFunction = Tokens.Motion.easeOut
+            layer.add(flash, forKey: "flashDropTarget\(pulse)")
+        }
+        #if DEBUG
+        debugDropFlashes = 2
+        #endif
+    }
+
+    #if DEBUG
+    /// How many times the row has flashed as a drop target, for a script or test.
+    private(set) var debugDropFlashes = 0
+    #endif
+
     func beginRename() {
         guard renameField == nil, let window else { return }
         let field = PlainTextField(font: title.font ?? Tokens.Font.body(), placeholder: isTabGroup ? String(localized: "Group name", comment: "Placeholder of the field that renames a group of tabs, in its sidebar row.")

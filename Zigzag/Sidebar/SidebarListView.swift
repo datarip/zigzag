@@ -410,6 +410,9 @@ final class SidebarListView: NSView {
         /// Over another window's sidebar: the one place its tab snapshot resolved, which the line there and the drop
         /// both read. Nil when the pointer is elsewhere or over that list's pinned rows.
         var externalDrop: SidebarDrop?
+        /// Over another window's pinned rows with a favorite or card: the drop that window resolved for its line.
+        /// The landing reads this same value, so the line and the drop cannot disagree.
+        var externalFavoriteDrop: SidebarDrop?
         /// Over another window's favorites grid: that window takes the drop as a favorite there.
         var externalFavorite: BrowserWindowController?
         /// The space it was picked up in; carried to another, it's no longer in the list on show.
@@ -433,9 +436,14 @@ final class SidebarListView: NSView {
     /// The tab snapshot target an external tab resolves to, made once per pointer position. The line and the drop
     /// read this, not a row count and a placeholder worked out again.
     private var externalDrop: SidebarDrop?
+    /// A favorite or pinned card from elsewhere over the pinned rows: the same answer its line draws and its landing
+    /// uses. Kept apart from a tab's so the card path never reads the tab path's placeholder.
+    private var externalFavoriteDrop: SidebarDrop?
     private var externalSnapshot: TabDropSnapshot?
     /// The pinned rows' snapshot for a tab from another window over the pinned section: it can land there now.
     private var externalPinnedSnapshot: DragSnapshot?
+    /// The last hover from elsewhere, so a folder that opens under it can be read again at the same point.
+    private var lastExternalHover: (point: NSPoint?, allowsPinned: Bool, carrying: SidebarItem?)?
 
     /// The two sections the list shows: the pinned rows and the tabs. Nonisolated so the drag resolver, which reads
     /// the section of a drop, can compare it off the main actor.
@@ -1046,6 +1054,70 @@ final class SidebarListView: NSView {
         for (item, view) in rows {
             guard let row = view as? FolderRowView, let rowID = Self.folderRowID(item) else { continue }
             row.isDropTarget = rowID == id
+        }
+    }
+
+    /// A drag resting on a shut folder: light it, flash it twice, and open it after 0.8 seconds so the pointer can go
+    /// in among its pages. The same wait and flash serve a row from this list and a card from another window.
+    private func restOnFolder(_ id: UUID?) {
+        guard let id, Library.shared.folder(id)?.isOpen == false else {
+            cancelFolderSpring()
+            return
+        }
+        guard springFolderID != id else { return }
+        cancelFolderSpring()
+        (rows[.folder(id)] as? FolderRowView)?.flashDropTarget()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.drag != nil {
+                    guard self.drag?.folderTarget == id else { return }
+                } else {
+                    let target = self.folderTarget(of: self.externalFavoriteDrop)
+                        ?? self.folderTarget(of: self.externalDrop)
+                    guard target == id else { return }
+                }
+                self.delegate?.listSetFolderOpen(id, true)
+                // The list leaves a library change alone while a drag runs, so it is rebuilt here: the folder's
+                // children show, and the target is resolved again at the pointer.
+                self.refreshDuringDrag()
+                if let point = self.lastDragPoint, var live = self.drag,
+                   let drop = live.snapshot.drop(at: point) {
+                    live.drop = drop
+                    live.targetSection = drop.section
+                    live.targetIndex = drop.index
+                    live.folderTarget = nil
+                    live.groupTarget = nil
+                    self.drag = live
+                    self.showFolderTarget(nil)
+                    self.placeLine()
+                } else if let last = self.lastExternalHover {
+                    self.externalHover(at: last.point, allowsPinned: last.allowsPinned, carrying: last.carrying)
+                }
+            }
+        }
+        springFolder = work
+        springFolderID = id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
+    }
+
+    private func cancelFolderSpring() {
+        springFolder?.cancel()
+        springFolder = nil
+        springFolderID = nil
+    }
+
+    private func folderTarget(of drop: SidebarDrop?) -> UUID? {
+        if case .onto(.folder(let id))? = drop?.place { return id }
+        return nil
+    }
+
+    /// A card from elsewhere over a shut folder's row uses the same rest and spring as a row.
+    private func noteExternalFolder(_ drop: SidebarDrop?) {
+        if let id = folderTarget(of: drop), Library.shared.folder(id)?.isOpen == false {
+            restOnFolder(id)
+        } else {
+            cancelFolderSpring()
         }
     }
 
@@ -1769,6 +1841,12 @@ final class SidebarListView: NSView {
     /// Where the drop line is, while it shows.
     var debugInsertionLine: NSRect? { insertionLine.superview === self && !insertionLine.isHidden ? insertionLine.frame : nil }
 
+    /// The insertion line in the window's top-left points, to compare with a row's own frame.
+    func debugInsertionLineInWindow() -> NSRect? {
+        guard let line = debugInsertionLine, let window else { return nil }
+        return insertionLine.convert(insertionLine.bounds, to: nil).flippedIn(window)
+    }
+
     /// Every row as it's laid out: a name a test can find it by, and where it is in the window.
     func debugRows() -> [(String, NSRect)] {
         guard let manager else { return [] }
@@ -2261,6 +2339,11 @@ final class SidebarListView: NSView {
     /// Returns the target it resolved, for the window carrying it to use at the drop: the same value the line shows.
     @discardableResult
     func externalHover(at screenPoint: NSPoint?, allowsPinned: Bool = false, carrying: SidebarItem? = nil) -> SidebarDrop? {
+        lastExternalHover = (screenPoint, allowsPinned, carrying)
+        if screenPoint == nil {
+            cancelFolderSpring()
+            externalFavoriteDrop = nil
+        }
         var landing: (section: Section, index: Int, pointX: CGFloat)?
         var resolved: SidebarDrop?
         var snapshot: TabDropSnapshot?
@@ -2340,9 +2423,12 @@ final class SidebarListView: NSView {
                 || resolved != externalDrop else { return resolved }
         external = landing
         externalDrop = resolved
+        // A card's line and landing both read this one answer; a tab keeps the tab path's drop.
+        externalFavoriteDrop = if case .bookmark? = carrying { resolved } else { nil }
         externalSnapshot = snapshot
         externalPinnedSnapshot = pinnedSnapshot
         placeLine()
+        noteExternalFolder(resolved)
         return resolved
     }
 
@@ -2628,7 +2714,9 @@ final class SidebarListView: NSView {
             let (above, below) = tabGap(of: drop, in: drag)
             // The parent is the drop's own, resolved with the pointer's sideways movement. Asking the snapshot again
             // here without it would read the row rule and could disagree with the line.
-            let group = drag.tabSnapshot.tabGapGroup(above: above, below: below, parent: drop.folder)
+            let group = drag.tabSnapshot.tabGapGroup(above: above, below: below, parent: drop.folder,
+                                                     pointerX: lastDragPoint?.x ?? drag.grabX,
+                                                     grabbedAt: drag.grabX, grabDepth: drag.grabDepth)
             return drop.folder == drag.originParent && group == drag.originGroup
         case nil:
             return false
@@ -2676,9 +2764,16 @@ final class SidebarListView: NSView {
             hideLine()
             return
         }
-        // Over the pinned rows, a tab from another window reads the pinned snapshot: a gap draws its line, a folder
-        // row that takes it lights up and the line stays away.
-        if external.section == .bookmarks, let drop = externalDrop, let snapshot = externalPinnedSnapshot {
+        // Over the pinned rows, a tab or a card from another window reads the pinned snapshot: a gap draws its line,
+        // a folder row that takes it lights up and the line stays away. A card's own drop is the one value its landing
+        // reads; without one there is no line, never a placeholder worked out a second way.
+        if external.section == .bookmarks {
+            let cardDrop = externalFavoriteDrop
+            guard let drop = cardDrop ?? externalDrop, let snapshot = externalPinnedSnapshot else {
+                showFolderTarget(nil)
+                hideLine()
+                return
+            }
             if case .onto(.folder(let id)) = drop.place {
                 hideLine()
                 showFolderTarget(id)
@@ -2917,8 +3012,10 @@ final class SidebarListView: NSView {
                 externalTarget?.externalHover(at: nil)
                 externalTarget = nil
                 drag.externalDrop = nil
+                drag.externalFavoriteDrop = nil
                 drag.externalFavorite = controller
                 self.drag?.externalDrop = nil
+                self.drag?.externalFavoriteDrop = nil
                 self.drag?.externalFavorite = controller
             } else {
                 if let previous = drag.externalFavorite, previous !== controller {
@@ -2931,15 +3028,19 @@ final class SidebarListView: NSView {
                 let target = list.externalHover(at: mouse, allowsPinned: drag.item.canBeFavorite || folderCarried,
                                                 carrying: drag.item)
                 drag.externalDrop = target
+                drag.externalFavoriteDrop = target
                 self.drag?.externalDrop = target
+                self.drag?.externalFavoriteDrop = target
             }
         } else if externalTarget != nil || drag.externalFavorite != nil {
             externalTarget?.externalHover(at: nil)
             externalTarget = nil
             drag.externalDrop = nil
+            drag.externalFavoriteDrop = nil
             drag.externalFavorite?.listDragOverFavorites(at: nil, carrying: nil)
             drag.externalFavorite = nil
             self.drag?.externalDrop = nil
+            self.drag?.externalFavoriteDrop = nil
             self.drag?.externalFavorite = nil
         }
 
@@ -3001,38 +3102,7 @@ final class SidebarListView: NSView {
             }
             // Resting on a shut folder opens it, so the pointer can then go in among its children and aim at a gap
             // there. A move off the row puts the wait away.
-            if let folderHit, Library.shared.folder(folderHit)?.isOpen == false {
-                if springFolderID != folderHit {
-                    springFolder?.cancel()
-                    let work = DispatchWorkItem { [weak self] in
-                        MainActor.assumeIsolated {
-                            guard let self, self.drag?.folderTarget == folderHit else { return }
-                            self.delegate?.listSetFolderOpen(folderHit, true)
-                            // The list leaves a library change alone while a drag runs, so it is rebuilt here: the
-                            // folder's children show, and the target is resolved again at the pointer.
-                            self.refreshDuringDrag()
-                            if let point = self.lastDragPoint, var live = self.drag,
-                               let drop = live.snapshot.drop(at: point) {
-                                live.drop = drop
-                                live.targetSection = drop.section
-                                live.targetIndex = drop.index
-                                live.folderTarget = nil
-                                live.groupTarget = nil
-                                self.drag = live
-                                self.showFolderTarget(nil)
-                                self.placeLine()
-                            }
-                        }
-                    }
-                    springFolder = work
-                    springFolderID = folderHit
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
-                }
-            } else if springFolder != nil {
-                springFolder?.cancel()
-                springFolder = nil
-                springFolderID = nil
-            }
+            restOnFolder(folderHit)
             if folderHit == nil, groupHit == nil {
                 // On a row's middle: offer to open the two side by side, the line out of the way. On its edges: the
                 // line shows where it would go.
@@ -3163,7 +3233,7 @@ final class SidebarListView: NSView {
 
     /// The target the external line shows, for the window carrying the row: it lands at the same index and folder the
     /// line drew, not at a second reading of the release point.
-    var externalDropTarget: SidebarDrop? { externalDrop }
+    var externalDropTarget: SidebarDrop? { externalFavoriteDrop ?? externalDrop }
 
     /// Drags the list along while the pointer comes near its top or bottom, before AppKit's own edge scroll starts: by
     /// the space's name the list is already moving, so the top of Pinned is easy to reach in a crowded section.
@@ -3235,11 +3305,26 @@ final class SidebarListView: NSView {
             }
         }
 
-        // Onto another window's favorites grid: that window makes it a favorite where its bar showed.
-        if let target = drag.externalFavorite, drag.item.canBeFavorite,
-           target.listDropOnFavorites([drag.item], dragged: drag.item) == true {
-            target.listDragOverFavorites(at: nil, carrying: nil)
-            return nil
+        // Onto another window's card grids: a tab moves to that window first, then becomes the card or the pinned
+        // page its grid showed. A pinned page or a favorite is every window's already and takes the grid directly.
+        if let target = drag.externalFavorite, drag.item.canBeFavorite {
+            if let tab, target.tabManager !== manager,
+               let source = window?.windowController as? BrowserWindowController {
+                if target.sidebar.favorites.isDropTarget,
+                   target.listFavoriteTabInWindow(tab, controller: source) {
+                    target.listDragOverFavorites(at: nil, carrying: nil)
+                    return nil
+                }
+                if target.sidebar.pinnedTiles.isDropTarget,
+                   target.listPinTabInWindowToTiles(tab, from: source) {
+                    target.listDragOverFavorites(at: nil, carrying: nil)
+                    return nil
+                }
+            }
+            if target.listDropOnFavorites([drag.item], dragged: drag.item) == true {
+                target.listDragOverFavorites(at: nil, carrying: nil)
+                return nil
+            }
         }
 
         // Onto the favorites grid, picked rows and all. Above the space's name is the grid; the name and below are Pinned.
@@ -3267,7 +3352,7 @@ final class SidebarListView: NSView {
         zzDragLog("drop item=\(drag.item) marked=\(marked.count) together=\(drag.together.count) picked=\(picked.count) section=\(drag.targetSection.map(String.init(describing:)) ?? "nil")")
         #endif
         let folderItem = if case .folder = drag.item { true } else { false }
-        if let externalList = external, let target = drag.externalDrop,
+        if let externalList = external, let target = drag.externalFavoriteDrop ?? drag.externalDrop,
            let controller = externalList.window?.windowController as? BrowserWindowController,
            controller.tabManager !== manager,
            let source = window?.windowController as? BrowserWindowController {
@@ -3385,7 +3470,9 @@ final class SidebarListView: NSView {
             let (above, below) = tabGap(of: tabDrop, in: drag)
             // The drop's own parent, resolved with the pointer's sideways movement: the line showed this value.
             gapParent = tabDrop.folder
-            gapGroup = drag.tabSnapshot.tabGapGroup(above: above, below: below, parent: gapParent)
+            gapGroup = drag.tabSnapshot.tabGapGroup(above: above, below: below, parent: gapParent,
+                                                    pointerX: lastDragPoint?.x ?? drag.grabX,
+                                                    grabbedAt: drag.grabX, grabDepth: drag.grabDepth)
         }
         // The move itself. Among the tabs, a picked selection is one change: the primary row lands first and `carry`
         // places the rest around it, and the nested `pageChange` calls coalesce, so one ⌘Z puts every row back.
@@ -3536,9 +3623,19 @@ final class SidebarListView: NSView {
 
     /// Redraws for a new space while a drag is in progress (the space slide is animated by the sidebar).
     func refreshDuringDrag() {
-        guard let drag else { return }
         items = buildItems()
         apply(items: items, animated: false)
+        guard let drag else {
+            // A folder opened under a card from another window: its hover is read again, not left on the old rows.
+            external = nil
+            externalDrop = nil
+            externalFavoriteDrop = nil
+            externalSnapshot = nil
+            externalPinnedSnapshot = nil
+            showFolderTarget(nil)
+            hideLine()
+            return
+        }
         // The list has changed under the drag, so its rows, order and maps are made again, and the target with them.
         self.drag?.snapshot = dragSnapshot(carrying: drag.item, carried: drag.carried)
         self.drag?.tabSnapshot = tabSnapshot(carrying: drag.item, carried: drag.carried)

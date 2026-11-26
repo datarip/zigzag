@@ -234,30 +234,35 @@ struct TabDropTests {
         #expect(line.y > teamFrame.maxY)
     }
 
-    /// Inside nested tabs the gap goes under the tab above it, one step deeper. Above A1a is under A1, at the second
-    /// step. Under A1a at the left edge it leaves the run. Indented, it stays under A1.
+    /// Inside nested tabs the gap goes under the tab above it, one step deeper, whenever the carried row is set in
+    /// there. Above A1a with the pointer a step in is under A1, at the second step. Under A1a at the left edge it
+    /// leaves the run; a pointer between the run's steps stays under A, the ancestor it is set in under.
     @Test func aNestedTabGap() throws {
         let c = SidebarItem.tab(try tree.tabID("C"))
         let a1 = SidebarItem.tab(try tree.tabID("A1"))
         let a1a = SidebarItem.tab(try tree.tabID("A1a"))
         let a1ID = try tree.tabID("A1")
         let b = SidebarItem.tab(try tree.tabID("B"))
-        let nested = try #require(tree.drop(try tree.point(in: a1a, .above, x: 0), carrying: c))
-        #expect(nested.index == 2)
-        #expect(nested.place == .gap(above: a1, below: a1a, depth: 2))
+        // Immediately above its first child, a row is already that child's parent: the gap is inside A1.
+        let plain = try #require(tree.drop(try tree.point(in: a1a, .above, x: 0), carrying: c))
+        #expect(plain.index == 2)
+        #expect(plain.place == .gap(above: a1, below: a1a, depth: 2))
+        #expect(plain.folder == a1ID)
         let out = try #require(tree.drop(try tree.point(in: a1a, .below, x: 0), carrying: c, grabbedAt: 0))
         #expect(out.place == .gap(above: a1a, below: b, depth: 0))
-        // The gap below the last nested tab is one of the two boundary gaps. Set in past half a step, the tab stays
-        // inside the open tab above, as its last child; short of it, it lands after that tab.
+        // Set in past half a step, the tab stays inside A1, as its last child.
         let setIn = try #require(tree.drop(try tree.point(in: a1a, .below,
                                                           x: SidebarListView.indent(depth: 2) - SidebarListView.folderIndent / 2 + 1),
                                            carrying: c, grabbedAt: 0))
         #expect(setIn.place == .gap(above: a1a, below: b, depth: 2))
         #expect(setIn.folder == a1ID)
+        // A level between the two stays under A, the ancestor the carried row is set in under.
         let kept = try #require(tree.drop(try tree.point(in: a1a, .below,
                                                         x: SidebarListView.indent(depth: 2) - SidebarListView.folderIndent / 2 - 1),
                                           carrying: c, grabbedAt: 0))
-        #expect(kept.place == .gap(above: a1a, below: b, depth: 0))
+        #expect(kept.place == .gap(above: a1a, below: b, depth: 1))
+        let aID = try tree.tabID("A")
+        #expect(kept.folder == aID)
     }
 
     /// A tab held over another tab's middle is the split offer, not a gap. Its index is still the gap the tab would
@@ -337,37 +342,64 @@ struct TabDropTests {
         }
     }
 
-    /// Moving the pointer right at an ordinary gap changes nothing: the level is the row's, never the pointer's.
-    @Test func theRowSetsTheLevelAtEveryOrdinaryGap() throws {
+    /// Every tab gap reads beta 6's rule: the carried row's start, moved across since pick-up, against each level's
+    /// step. This compares the snapshot with beta 6's own TabTree.dropParent call at every row edge and every
+    /// sideways position, so the two cannot drift apart without a test saying so.
+    @Test func everyGapSetsInAsBetaSixDid() throws {
         let c = SidebarItem.tab(try tree.tabID("C"))
-        let a = SidebarItem.tab(try tree.tabID("A"))
-        let a1a = SidebarItem.tab(try tree.tabID("A1a"))
-        let team = SidebarItem.tabGroup(try tree.groupID("Team"))
-        let t1 = SidebarItem.tab(try tree.tabID("T1"))
-        for gap in [a, a1a, team, t1] {
-            let left = try #require(tree.drop(try tree.point(in: gap, .above, x: 0), carrying: c, grabbedAt: 0))
-            let right = try #require(tree.drop(try tree.point(in: gap, .above, x: 200), carrying: c, grabbedAt: 0))
-            #expect(left.place == right.place, "\(gap) above: the pointer's x changed the level")
-            #expect(left.folder == right.folder, "\(gap) above: the pointer's x changed the parent")
+        let shown = tree.snapshot(carrying: c)
+        let groups = tree.groupOf
+        func isSplit(_ item: SidebarItem?) -> Bool {
+            guard let item, let at = shown.rows.firstIndex(where: { $0.item == item }) else { return false }
+            return shown.rowTabs[at].count > 1
         }
-        // Below a tab with tabs under it is ordinary too: the gap is inside that tab at the row's level.
-        let belowA = try #require(tree.drop(try tree.point(in: a, .below, x: 0), carrying: c, grabbedAt: 0))
-        let belowARight = try #require(tree.drop(try tree.point(in: a, .below, x: 200), carrying: c, grabbedAt: 0))
-        #expect(belowA.place == belowARight.place)
+        func betaParent(above: SidebarItem?, below: SidebarItem?, x: CGFloat) -> UUID? {
+            if case .tabGroup? = above { return nil }
+            let before: UUID? = if case .tab(let id)? = above { id } else { nil }
+            let after: UUID? = if case .tab(let id)? = below { id } else { nil }
+            let inGroup = before.flatMap { groups[$0] } != nil ? 1 : 0
+            let nests = !isSplit(above) && !shown.carried.contains(where: { isSplit($0) })
+            return TabTree.dropParent(before: before, after: after, in: shown.nodes, nests: nests) { level in
+                SidebarListView.setsIn(x, depth: level + inGroup)
+            }
+        }
+        for row in shown.rows where !shown.carried.contains(row.item) {
+            for band in [RowBand.above, .below] {
+                let y = band == .above ? row.frame.minY + row.frame.height * 0.1
+                                       : row.frame.maxY - row.frame.height * 0.1
+                for x in [CGFloat(0), 7, 14, 21, 28, 60, 200] {
+                    let point = NSPoint(x: x, y: y)
+                    let drop = try #require(shown.drop(at: point, grabbedAt: 0))
+                    let above: SidebarItem? = if case .gap(let a, _, _) = drop.place { a } else { nil }
+                    let below: SidebarItem? = if case .gap(_, let b, _) = drop.place { b } else { nil }
+                    // A row's middle is its split offer, never a gap.
+                    guard case .gap = drop.place else { continue }
+                    let x0 = SidebarListView.nestX(pointer: x, grabbedAt: 0, depth: 0)
+                    #expect(drop.folder == betaParent(above: above, below: below, x: x0),
+                            "\(row.item) \(band) x=\(x): parent differs from beta 6")
+                }
+            }
+        }
     }
 
-    /// The last row inside an open tab is a boundary gap: short of half a step the tab lands after that tab, past it
-    /// the tab becomes the open tab's last child. The line and the drop read the same answer.
+    /// Below the last row inside an open tab, beta 6's sideways movement still sets the level: short of half a step
+    /// the tab lands after that tab, at the next step in it goes under the ancestor it is set in under, and past the
+    /// deepest step it becomes A1's last child. The line and the drop read the same answer.
     @Test func theLastChildOfAnOpenFolderPicksInsideOrAfterIt() throws {
         let c = SidebarItem.tab(try tree.tabID("C"))
         let b = SidebarItem.tab(try tree.tabID("B"))
         let a1ID = try tree.tabID("A1")
         let a1a = SidebarItem.tab(try tree.tabID("A1a"))
         let half = SidebarListView.folderIndent / 2
-        let after = try #require(tree.drop(try tree.point(in: a1a, .below, x: SidebarListView.indent(depth: 2) - half - 1),
+        let after = try #require(tree.drop(try tree.point(in: a1a, .below, x: SidebarListView.indent(depth: 1) - half - 1),
                                            carrying: c, grabbedAt: 0))
         #expect(after.place == .gap(above: a1a, below: b, depth: 0))
         #expect(after.folder == nil)
+        let between = try #require(tree.drop(try tree.point(in: a1a, .below, x: SidebarListView.indent(depth: 2) - half - 1),
+                                             carrying: c, grabbedAt: 0))
+        #expect(between.place == .gap(above: a1a, below: b, depth: 1))
+        let aID = try tree.tabID("A")
+        #expect(between.folder == aID)
         let inside = try #require(tree.drop(try tree.point(in: a1a, .below, x: SidebarListView.indent(depth: 2) - half + 1),
                                             carrying: c, grabbedAt: 0))
         #expect(inside.place == .gap(above: a1a, below: b, depth: 2))

@@ -129,12 +129,13 @@
   Test: NumberHintsTests.numbersGoToTheirPlaceAndNineToTheLast
 
 ## Nesting
-- Drag a tab below a row → the line and the drop take the row's level. Moving the pointer right does not change the level, except at the two boundary gaps below; never deeper than two levels, and never under or as a split.
-  Test: TabDropTests.theRowSetsTheLevelAtEveryOrdinaryGap
-- Just below the last row inside an open folder → moving the pointer right past half a step sets the line one level in, so the tab becomes the folder's last child. Left of the half step it lands after the folder.
-  Test: TabDropTests.theLastChildOfAnOpenFolderPicksInsideOrAfterIt
-- Just below a row with no children → moving the pointer right past half a step sets the line one level in, so the tab becomes that row's first child. Left of the half step it lands after the row.
-  Test: TabDropTests.aRowWithNoChildrenPicksAFirstChildOrSibling
+- Drag a tab and move the pointer right past half a step → the line sets in a level and the drop puts it under the row above, as that tab's last, even one with nothing under it yet. It is never deeper than two levels, and never under or as a split.
+  Test: TabDropTests.everyGapSetsInAsBetaSixDid
+  Test: NestedTabsTests.setInPastTheRowAboveADropGoesUnderIt
+- While dragging, how far the pointer moved across since the row was picked up sets the level, the same by finger. Half a step back left takes it back out.
+  Test: NestedTabsTests.movingAcrossSetsTheCarriedRowInAndOut
+- Drag a tab right in its own place → the line shows set in, right under the row above.
+  Test: NestedTabRowsTests.draggedRightTheLineSetsInRightUnderTheRowAbove
 - The last tab under a tab leaves → that tab's chevron goes too.
   Test: NestedTabRowsTests.theChevronGoesWithTheLastTabUnderIt
 - ⌃⇧→ (View › Nest Tab) → the tab you're on goes under the tab above it at its level, with the tabs under it; ⌃⇧← (Unnest Tab) → it goes a level out, just after the tab it was under and that tab's run.
