@@ -184,6 +184,9 @@
   Test: SidebarCardDragTests.aCardOverAShutFolderFlashesTwiceThenOpensIt
 - A drag swept quickly across shut folders → only the folder it rests on fills, then flashes twice and opens after 0.8 seconds. Rows crossed leave no fill behind.
   Test: SidebarCardDragTests.aFastSweepLightsOnlyTheFolderItStopsOn
+- A drag that opens a shut folder then moves away → it closes again. Folders open before the drag stay open, and the drop's folder stays open.
+  Test: SidebarCardDragTests.aFolderOpenedByTheDragClosesWhenThePointerLeavesIt
+  Test: SidebarCardDragTests.aFolderAlreadyOpenStaysOpenWhenTheDragMovesOn
 - A row dropped between tiles → pinned there, out of any folder; on a tile's middle, the two open side by side.
   Test: AppearanceSwitchesTests.aFoldersPageDroppedOnTheTilesIsPinnedThereOutOfItsFolder
 - A favorite dropped between tiles → pinned there; it leaves Favorites.

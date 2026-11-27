@@ -212,6 +212,110 @@ struct SidebarCardDragTests {
         }
     }
 
+    /// A folder opened by the drag closes when the pointer leaves it for another folder. The folder that holds the
+    /// new pointer stays open, and so does the folder a drop lands in.
+    @Test func aFolderOpenedByTheDragClosesWhenThePointerLeavesIt() async throws {
+        let saved = Library.shared.snapshot
+        defer { Library.shared.restore(saved) }
+        let tree = try makeTree()
+        Library.shared.setFolderOpen(tree.work.id, false)
+        Library.shared.setFolderOpen(tree.docs.id, false)
+        let profile = Library.shared.profileID(ofSpace: tree.space)
+        let favorite = Library.shared.addFavorite(url: URL(string: "https://example.com/x1")!, title: "X1", in: profile)
+        let manager = TabManager(spaceID: tree.space)
+        defer { manager.invalidate() }
+        let controller = window(manager)
+        defer { controller.window?.close() }
+        controller.window?.orderFront(nil)
+        let list = controller.sidebar.list
+        list.reload(animated: false)
+        list.layoutSubtreeIfNeeded()
+        let window = try #require(controller.window)
+        func point(_ name: String, y: CGFloat? = nil) throws -> NSPoint {
+            let frame = try #require(rows(list)[name])
+            return screenPoint(NSPoint(x: frame.midX, y: y ?? frame.midY), in: window)
+        }
+
+        _ = list.externalHover(at: try point("folder:Work"), allowsPinned: true, carrying: .bookmark(favorite.id))
+        try await Task.sleep(for: .milliseconds(1000))
+        #expect(Library.shared.folder(tree.work.id)?.isOpen == true)
+        _ = list.externalHover(at: try point("folder:Docs"), allowsPinned: true, carrying: .bookmark(favorite.id))
+        try await Task.sleep(for: .milliseconds(1000))
+        #expect(Library.shared.folder(tree.docs.id)?.isOpen == true)
+
+        // The gap above A is inside Work but outside Docs. Docs closes, Work stays.
+        let a = try #require(rows(list)["pin:A"])
+        _ = list.externalHover(at: screenPoint(NSPoint(x: a.midX, y: a.minY - 1), in: window),
+                               allowsPinned: true, carrying: .bookmark(favorite.id))
+        #expect(Library.shared.folder(tree.docs.id)?.isOpen == false)
+        #expect(Library.shared.folder(tree.work.id)?.isOpen == true)
+
+        let drop = try #require(list.externalDropTarget)
+        #expect(drop.folder == tree.work.id)
+        list.externalDragFinished(keeping: drop)
+        #expect(Library.shared.folder(tree.work.id)?.isOpen == true)
+    }
+
+    /// A folder a canceled drag opened closes again. The landing path keeps the folder it lands in.
+    @Test func aCancelledDragClosesTheFolderItOpened() async throws {
+        let saved = Library.shared.snapshot
+        defer { Library.shared.restore(saved) }
+        let tree = try makeTree()
+        Library.shared.setFolderOpen(tree.old.id, false)
+        let profile = Library.shared.profileID(ofSpace: tree.space)
+        let favorite = Library.shared.addFavorite(url: URL(string: "https://example.com/x1")!, title: "X1", in: profile)
+        let manager = TabManager(spaceID: tree.space)
+        defer { manager.invalidate() }
+        let controller = window(manager)
+        defer { controller.window?.close() }
+        controller.window?.orderFront(nil)
+        let list = controller.sidebar.list
+        list.reload(animated: false)
+        list.layoutSubtreeIfNeeded()
+        let window = try #require(controller.window)
+        let old = try #require(rows(list)["folder:Old"])
+        _ = list.externalHover(at: screenPoint(NSPoint(x: old.midX, y: old.midY), in: window),
+                               allowsPinned: true, carrying: .bookmark(favorite.id))
+        try await Task.sleep(for: .milliseconds(1000))
+        #expect(Library.shared.folder(tree.old.id)?.isOpen == true)
+        list.externalDragFinished(keeping: nil)
+        #expect(Library.shared.folder(tree.old.id)?.isOpen == false)
+    }
+
+    /// A folder open before the drag is never in the ledger, so moving away leaves it open.
+    @Test func aFolderAlreadyOpenStaysOpenWhenTheDragMovesOn() async throws {
+        let saved = Library.shared.snapshot
+        defer { Library.shared.restore(saved) }
+        let tree = try makeTree()
+        Library.shared.setFolderOpen(tree.work.id, true)
+        Library.shared.setFolderOpen(tree.docs.id, false)
+        let profile = Library.shared.profileID(ofSpace: tree.space)
+        let favorite = Library.shared.addFavorite(url: URL(string: "https://example.com/x1")!, title: "X1", in: profile)
+        let manager = TabManager(spaceID: tree.space)
+        defer { manager.invalidate() }
+        let controller = window(manager)
+        defer { controller.window?.close() }
+        controller.window?.orderFront(nil)
+        let list = controller.sidebar.list
+        list.reload(animated: false)
+        list.layoutSubtreeIfNeeded()
+        let window = try #require(controller.window)
+        func point(_ name: String) throws -> NSPoint {
+            let frame = try #require(rows(list)[name])
+            return screenPoint(NSPoint(x: frame.midX, y: frame.midY), in: window)
+        }
+
+        _ = list.externalHover(at: try point("folder:Work"), allowsPinned: true, carrying: .bookmark(favorite.id))
+        try await Task.sleep(for: .milliseconds(150))
+        _ = list.externalHover(at: try point("folder:Docs"), allowsPinned: true, carrying: .bookmark(favorite.id))
+        try await Task.sleep(for: .milliseconds(1000))
+        #expect(Library.shared.folder(tree.docs.id)?.isOpen == true)
+        #expect(Library.shared.folder(tree.work.id)?.isOpen == true)
+        list.externalDragFinished(keeping: nil)
+        #expect(Library.shared.folder(tree.docs.id)?.isOpen == false)
+        #expect(Library.shared.folder(tree.work.id)?.isOpen == true)
+    }
+
     /// A fast sweep across shut folders lights none of the rows it crosses. The landing is the last folder at once;
     /// the fill waits for the rest, then the one folder left behind flashes twice and opens. A row left behind goes
     /// dark at once, with no fade or flash still running.

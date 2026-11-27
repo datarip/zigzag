@@ -433,6 +433,8 @@ final class SidebarListView: NSView {
         var originGroup: UUID?
         /// Group row the dragged tab hovers; dropping adds it to that group.
         var groupTarget: UUID?
+        /// Folders this drag opened from shut, to close again if the pointer leaves them without a drop.
+        var autoOpened: Set<UUID> = []
         /// False for Zigzag's own views (#472): Pinned, its folders and the favorites don't take them.
         var pinnable = true
     }
@@ -448,6 +450,8 @@ final class SidebarListView: NSView {
     private var externalSnapshot: TabDropSnapshot?
     /// The pinned rows' snapshot for a tab from another window over the pinned section: it can land there now.
     private var externalPinnedSnapshot: DragSnapshot?
+    /// Folders an outside drag opened from shut in this list, to close again when it leaves them.
+    private var externalAutoOpened: Set<UUID> = []
     /// The last hover from elsewhere, so a folder that opens under it can be read again at the same point.
     private var lastExternalHover: (point: NSPoint?, allowsPinned: Bool, carrying: SidebarItem?)?
 
@@ -1107,6 +1111,12 @@ final class SidebarListView: NSView {
                         ?? self.folderTarget(of: self.externalDrop)
                     guard target == id else { return }
                 }
+                guard let folder = Library.shared.folder(id), !folder.isOpen else { return }
+                if self.drag != nil {
+                    self.drag?.autoOpened.insert(id)
+                } else {
+                    self.externalAutoOpened.insert(id)
+                }
                 self.delegate?.listSetFolderOpen(id, true)
                 // The list leaves a library change alone while a drag runs, so it is rebuilt here: the folder's
                 // children show, and the target is resolved again at the pointer.
@@ -1122,7 +1132,8 @@ final class SidebarListView: NSView {
                     self.showFolderTarget(nil)
                     self.placeLine()
                 } else if let last = self.lastExternalHover {
-                    self.externalHover(at: last.point, allowsPinned: last.allowsPinned, carrying: last.carrying)
+                    self.externalHover(at: last.point, allowsPinned: last.allowsPinned, carrying: last.carrying,
+                                       closingAutoOpened: false)
                 }
             }
         }
@@ -1140,6 +1151,104 @@ final class SidebarListView: NSView {
     private func folderTarget(of drop: SidebarDrop?) -> UUID? {
         if case .onto(.folder(let id))? = drop?.place { return id }
         return nil
+    }
+
+    private func groupTarget(of drop: SidebarDrop?) -> UUID? {
+        if case .onto(.tabGroup(let id))? = drop?.place { return id }
+        return nil
+    }
+
+    /// The folder a drop lands in, from a folder row's middle or the parent at its gap, and every folder above it.
+    private func folderChain(for drop: SidebarDrop?) -> Set<UUID> {
+        var chain: Set<UUID> = []
+        if case .onto(.folder(let id))? = drop?.place { addFolderAndAncestors(id, to: &chain) }
+        if let id = drop?.folder { addFolderAndAncestors(id, to: &chain) }
+        return chain
+    }
+
+    /// The folders the pointer keeps open: the folder it would land in or on, the folder whose row it is over, and
+    /// every parent. A folder stays open while the pointer is on it or anywhere inside its block.
+    private func foldersKept(at point: NSPoint, drop: SidebarDrop?) -> Set<UUID> {
+        var chain = folderChain(for: drop)
+        if let item = rows.first(where: { $0.value.superview === self && !$0.value.isHidden && $0.value.frame.contains(point) })?.key {
+            if let id = Self.folderRowID(item) { addFolderAndAncestors(id, to: &chain) }
+            if case .bookmark(let id) = item, let folder = Library.shared.folderID(containing: id) {
+                addFolderAndAncestors(folder, to: &chain)
+            }
+        }
+        return chain
+    }
+
+    private func addFolderAndAncestors(_ id: UUID, to chain: inout Set<UUID>) {
+        var current: UUID? = id
+        while let folderID = current, let folder = Library.shared.folder(folderID) {
+            guard chain.insert(folder.id).inserted else { break }
+            current = folder.parentID
+        }
+    }
+
+    /// Closes the folders this drag opened from shut that no longer hold the pointer. The caller rebuilds the list,
+    /// which ignores a library change while a drag runs.
+    @discardableResult
+    private func closeAutoOpenedFolders(keeping keep: Set<UUID>) -> Bool {
+        guard var live = drag else { return closeExternalAutoOpened(keeping: keep) }
+        let closing = live.autoOpened.subtracting(keep)
+        guard !closing.isEmpty else { return false }
+        live.autoOpened.subtract(closing)
+        drag = live
+        closeFolders(closing)
+        return true
+    }
+
+    /// The same cleanup for a drag from another window, whose ledger this list owns. Kept folders stay in the
+    /// ledger, so a later move away can close them.
+    @discardableResult
+    private func closeExternalAutoOpened(keeping keep: Set<UUID>) -> Bool {
+        let closing = externalAutoOpened.subtracting(keep)
+        guard !closing.isEmpty else { return false }
+        externalAutoOpened.subtract(closing)
+        closeFolders(closing)
+        return true
+    }
+
+    /// Ends an outside drag: closes the folders it opened from shut except the landing chain, and forgets all of
+    /// them, so a folder left open at the drop is not closed by a later hover.
+    @discardableResult
+    private func finishExternalAutoOpened(keeping keep: Set<UUID>) -> Bool {
+        let closing = externalAutoOpened.subtracting(keep)
+        externalAutoOpened.removeAll()
+        guard !closing.isEmpty else { return false }
+        closeFolders(closing)
+        return true
+    }
+
+    private func closeFolders(_ ids: Set<UUID>) {
+        for id in ids.sorted(by: { Library.shared.depth(ofFolder: $0) > Library.shared.depth(ofFolder: $1) }) {
+            guard Library.shared.folder(id)?.isOpen == true else { continue }
+            delegate?.listSetFolderOpen(id, false)
+        }
+    }
+
+    /// Closes the folders a finished drag opened from shut, keeping only the chain it landed in.
+    private func closeAutoOpened(_ ids: Set<UUID>, keeping keep: Set<UUID>) {
+        let closing = ids.subtracting(keep)
+        guard !closing.isEmpty else { return }
+        closeFolders(closing)
+    }
+
+    /// Rebuilds the list after a folder closed under the drag, then reads the target at the pointer again.
+    private func refreshDragAfterAutoClose(at point: NSPoint) {
+        refreshDuringDrag()
+        guard var live = drag else { return }
+        let target = resolved(at: point, dragging: live)
+        live.targetSection = target.section
+        live.targetIndex = target.index
+        live.drop = target.drop
+        live.folderTarget = folderTarget(of: target.drop)
+        live.groupTarget = groupTarget(of: target.drop)
+        self.drag = live
+        showFolderTarget(live.folderTarget ?? live.groupTarget)
+        placeLine()
     }
 
     /// Pages Clear would close while it has hover or focus; their rows dim.
@@ -2364,13 +2473,20 @@ final class SidebarListView: NSView {
     /// Something from elsewhere hovering this list: the line shows where it would land (nil to hide it).
     /// `allowsPinned`: what's carried can land among the pinned tabs too. `carrying`: the row being carried, so a tab
     /// can resolve against the pinned rows as a page does, and one that is pinned itself leaves its row out.
+    /// `closingAutoOpened`: false when the list reads the same hover again after a folder opened, so that read does
+    /// not count as the pointer moving away.
     /// Returns the target it resolved, for the window carrying it to use at the drop: the same value the line shows.
     @discardableResult
-    func externalHover(at screenPoint: NSPoint?, allowsPinned: Bool = false, carrying: SidebarItem? = nil) -> SidebarDrop? {
+    func externalHover(at screenPoint: NSPoint?, allowsPinned: Bool = false, carrying: SidebarItem? = nil,
+                       closingAutoOpened: Bool = true) -> SidebarDrop? {
         lastExternalHover = (screenPoint, allowsPinned, carrying)
         if screenPoint == nil {
             cancelFolderSpring()
             externalFavoriteDrop = nil
+            if closingAutoOpened, closeExternalAutoOpened(keeping: []) {
+                refreshDuringDrag()
+                return nil
+            }
         }
         var landing: (section: Section, index: Int, pointX: CGFloat)?
         var resolved: SidebarDrop?
@@ -2456,7 +2572,22 @@ final class SidebarListView: NSView {
         externalSnapshot = snapshot
         externalPinnedSnapshot = pinnedSnapshot
         placeLine()
+        if closingAutoOpened, let screenPoint, let window,
+           closeExternalAutoOpened(keeping: foldersKept(
+               at: convert(window.convertPoint(fromScreen: screenPoint), from: nil), drop: resolved)) {
+            // The rows the close changed are rebuilt, and the same hover is read again at the pointer.
+            refreshDuringDrag()
+            return externalHover(at: screenPoint, allowsPinned: allowsPinned, carrying: carrying,
+                                 closingAutoOpened: closingAutoOpened)
+        }
         return resolved
+    }
+
+    /// The drag that was over this list has ended. Keep the folder it landed in open, and close the rest this drag
+    /// opened from shut.
+    func externalDragFinished(keeping landing: SidebarDrop?) {
+        if finishExternalAutoOpened(keeping: folderChain(for: landing)) { refreshDuringDrag() }
+        externalHover(at: nil)
     }
 
     /// Whether a row carried from elsewhere is a pinned row or a tab: both have a place in an empty space.
@@ -3089,6 +3220,8 @@ final class SidebarListView: NSView {
         var index = drag.targetIndex
         var candidate: SplitDrop?
         var drop: SidebarDrop?
+        // The folders the pointer keeps open, and where to read the target again if a folder has to close.
+        var autoClose: (point: NSPoint?, keep: Set<UUID>) = (nil, [])
         if let (_, list) = hit, list === self, !overFavorites {
             autoscroll(with: event)
             let point = convert(windowPoint, from: nil)
@@ -3126,6 +3259,7 @@ final class SidebarListView: NSView {
                 drag.groupTarget = groupHit
                 showFolderTarget(folderHit ?? groupHit)
             }
+            if !drag.autoOpened.isEmpty { autoClose = (point, foldersKept(at: point, drop: drop)) }
             // Resting on a shut folder opens it, so the pointer can then go in among its children and aim at a gap
             // there. The wait starts once the fill shows, in `showFolderTarget`.
             if folderHit == nil, groupHit == nil {
@@ -3189,7 +3323,7 @@ final class SidebarListView: NSView {
         }
         drag.hoverSpace = hovered
         // On the space dots it's going to a space, not to a place in this list: no line meanwhile.
-        if hovered != nil { section = nil; drop = nil }
+        if hovered != nil { section = nil; drop = nil; autoClose = (nil, []) }
         // Crossing between pinned tabs and tabs is a different kind of place: a tap says so.
         if let section, let old = drag.targetSection, section != old { tapForTarget() }
         // Nothing it would land on has changed: the line, the highlight and the line's place all stay as they are.
@@ -3202,6 +3336,14 @@ final class SidebarListView: NSView {
             SidebarDragTiming.targetChanged()
             placeLine()
         }
+        let mayClose = targetChanged || autoClose.point == nil
+        if mayClose, closeAutoOpenedFolders(keeping: autoClose.keep) {
+            if let point = autoClose.point {
+                refreshDragAfterAutoClose(at: point)
+            } else {
+                refreshDuringDrag()
+            }
+        }
     }
 
     /// Ends a drag: let go at a point on screen, or called off with Esc (nil), changing nothing. The copy lands on
@@ -3210,9 +3352,9 @@ final class SidebarListView: NSView {
         guard let drag else { return }
         let external = externalTarget
         let externalFavorite = drag.externalFavorite
+        let autoOpened = drag.autoOpened
         self.drag = nil
         externalTarget = nil
-        external?.externalHover(at: nil)
         showFolderTarget(nil)
         hideLine()
         springWork?.cancel()
@@ -3230,9 +3372,14 @@ final class SidebarListView: NSView {
         var landing: NSView?
         if let mouse {
             landing = drop(drag, at: mouse, into: external)
+            external?.externalDragFinished(keeping: drag.externalFavoriteDrop ?? drag.externalDrop)
+            let keep = external == nil && drag.targetSection == .bookmarks ? folderChain(for: drag.drop) : []
+            closeAutoOpened(autoOpened, keeping: keep)
         } else {
             delegate?.listDragEnded()
             if let manager, manager.currentSpaceID != drag.originSpace { delegate?.listSwitchSpaceDuringDrag(drag.originSpace) }
+            external?.externalDragFinished(keeping: nil)
+            closeAutoOpened(autoOpened, keeping: [])
             landing = drag.view
         }
         externalFavorite?.listDragOverFavorites(at: nil, carrying: nil)
