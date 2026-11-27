@@ -615,10 +615,10 @@ import WebKit
             await expectRows(controller, ["▸New Folder", "*Tab", "Filed"])
             controller.listSetFolderOpen(folder.id, true)
             await expectRows(controller, ["▾New Folder", "~Pinned", "*Tab", "Filed"])
-            // A tab let go in the gap just under the open folder's row: pinned in it, at its top.
-            let row = try #require(controller.sidebar.list.row(forFolder: folder.id))
-            let frame = row.convert(row.bounds, to: nil)
-            try await drag(tabs[1], to: NSPoint(x: frame.midX, y: frame.minY + 2), in: controller)
+            // A tab let go in the gap at the top of the folder's first page: pinned in it, at its top.
+            let child = try #require(controller.sidebar.list.row(forBookmark: mark.id))
+            let childFrame = child.convert(child.bounds, to: nil)
+            try await drag(tabs[1], to: NSPoint(x: childFrame.midX, y: childFrame.maxY - 2), in: controller)
             let filed = Library.shared.folder(folder.id)?.bookmarkIDs.compactMap { Library.shared.bookmark($0)?.title } ?? []
             #expect(filed.sorted() == ["Filed", "Pinned"], "\(filed)")
             let rows = await screen(controller).rows
