@@ -40,6 +40,11 @@ struct SidebarCardDragTests {
         window.convertPoint(toScreen: NSPoint(x: topLeft.x, y: window.frame.height - topLeft.y))
     }
 
+    /// The middle of a row as it is on screen now, after any layout that followed the first read.
+    private func point(of row: NSView, in window: NSWindow) -> NSPoint {
+        window.convertPoint(toScreen: row.convert(NSPoint(x: row.bounds.midX, y: row.bounds.midY), to: nil))
+    }
+
     private func rows(_ list: SidebarListView) -> [String: NSRect] {
         Dictionary(uniqueKeysWithValues: list.debugRows().map { ($0.0, $0.1) })
     }
@@ -352,8 +357,8 @@ struct SidebarCardDragTests {
         // The whole sweep lands in one turn of the run loop, as a quick hand moves it: no row waits long enough to
         // light while the pointer crosses it.
         for folder in ordered {
-            _ = list.externalHover(at: screenPoint(NSPoint(x: folder.frame.midX, y: folder.frame.midY), in: window),
-                                   allowsPinned: true, carrying: .bookmark(favorite.id))
+            let row = try #require(list.folderRow(folder.id))
+            _ = list.externalHover(at: point(of: row, in: window), allowsPinned: true, carrying: .bookmark(favorite.id))
         }
         let last = try #require(ordered.last)
         #expect(list.externalDropTarget?.folder == last.id)
@@ -373,8 +378,8 @@ struct SidebarCardDragTests {
 
         // Leaving it for another folder clears it at once: no fill, no flash, still running.
         let first = try #require(ordered.first)
-        _ = list.externalHover(at: screenPoint(NSPoint(x: first.frame.midX, y: first.frame.midY), in: window),
-                               allowsPinned: true, carrying: .bookmark(favorite.id))
+        let firstView = try #require(list.folderRow(first.id))
+        _ = list.externalHover(at: point(of: firstView, in: window), allowsPinned: true, carrying: .bookmark(favorite.id))
         #expect(!lastRow.isDropTarget)
         #expect(lastRow.debugDropAnimations.isEmpty)
 
