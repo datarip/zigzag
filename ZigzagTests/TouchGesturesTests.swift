@@ -2083,7 +2083,11 @@ final class TouchListHost: SidebarListDelegate {
     func listSwitchSpaceDuringDrag(_ spaceID: UUID) {}
     func listDropOutside(_ tabs: [Tab], at screenPoint: NSPoint) -> Bool { false }
     func listMoveToWindow(_ tabs: [Tab], controller: BrowserWindowController, index: Int) -> Bool { false }
-    func listMovePinnedToWindow(_ bookmarkID: UUID, controller: BrowserWindowController, at screenPoint: NSPoint) -> NSView? { nil }
+    func listFavoriteTabInWindow(_ tab: Tab, controller: BrowserWindowController) -> Bool { false }
+    func listMovePinned(_ item: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) {}
+    func listMovePicked(_ items: [SidebarItem], around dragged: SidebarItem, to drop: SidebarDrop, in spaceID: UUID) {}
+    func listMovePickedToSpace(_ items: [SidebarItem], spaceID: UUID) {}
+    func listMovePinnedToWindow(_ bookmarkID: UUID, controller: BrowserWindowController, to drop: SidebarDrop?, at screenPoint: NSPoint) -> NSView? { nil }
     func listMoveBookmark(_ id: UUID, to index: Int, in spaceID: UUID) {}
     func listDragOverFavorites(at windowPoint: NSPoint?, carrying: TabManager.SplitSide?) -> Bool { false }
     func listSplit(_ tab: Tab, with other: Tab, otherOnRight: Bool) {}
