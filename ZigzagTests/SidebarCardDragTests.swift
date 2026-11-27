@@ -203,11 +203,83 @@ struct SidebarCardDragTests {
             let point = screenPoint(NSPoint(x: oldFrame.midX, y: oldFrame.midY), in: try #require(controller.window))
             _ = list.externalHover(at: point, allowsPinned: true, carrying: .bookmark(favorite.id))
             let row = try #require(list.folderRow(tree.old.id) as? FolderRowView)
+            #expect(!row.isDropTarget)
+            try await Task.sleep(for: .milliseconds(120))
             #expect(row.isDropTarget)
             #expect(row.debugDropFlashes == 2)
             try await Task.sleep(for: .milliseconds(900))
             #expect(Library.shared.folder(tree.old.id)?.isOpen == true)
         }
+    }
+
+    /// A fast sweep across shut folders lights none of the rows it crosses. The landing is the last folder at once;
+    /// the fill waits for the rest, then the one folder left behind flashes twice and opens. A row left behind goes
+    /// dark at once, with no fade or flash still running.
+    @Test func aFastSweepLightsOnlyTheFolderItStopsOn() async throws {
+        let saved = Library.shared.snapshot
+        defer { Library.shared.restore(saved) }
+        let tree = try makeTree()
+        let names = ["Library", "Java", "Web", "Linux", "Saved 2", "Saved 3", "Saved 4"]
+        var folders: [(id: UUID, name: String)] = []
+        for name in names {
+            let page = try #require(Library.shared.addBookmark(
+                url: URL(string: "https://example.com/\(UUID().uuidString)")!, title: name + " page", to: tree.space))
+            let folder = try #require(Library.shared.addFolder(named: name, with: [page.id], in: tree.space))
+            Library.shared.setFolderOpen(folder.id, false)
+            folders.append((folder.id, name))
+        }
+        let profile = Library.shared.profileID(ofSpace: tree.space)
+        let favorite = Library.shared.addFavorite(url: URL(string: "https://example.com/x1")!, title: "X1", in: profile)
+        let manager = TabManager(spaceID: tree.space)
+        defer { manager.invalidate() }
+        let controller = window(manager)
+        defer { controller.window?.close() }
+        controller.window?.orderFront(nil)
+        let list = controller.sidebar.list
+        list.reload(animated: false)
+        list.layoutSubtreeIfNeeded()
+        let frames = rows(list)
+        let ordered = folders.compactMap { folder -> (id: UUID, name: String, frame: NSRect)? in
+            frames["folder:" + folder.name].map { (folder.id, folder.name, $0) }
+        }.sorted { $0.frame.minY < $1.frame.minY }
+        #expect(ordered.count == names.count)
+        let window = try #require(controller.window)
+
+        // The whole sweep lands in one turn of the run loop, as a quick hand moves it: no row waits long enough to
+        // light while the pointer crosses it.
+        for folder in ordered {
+            _ = list.externalHover(at: screenPoint(NSPoint(x: folder.frame.midX, y: folder.frame.midY), in: window),
+                                   allowsPinned: true, carrying: .bookmark(favorite.id))
+        }
+        let last = try #require(ordered.last)
+        #expect(list.externalDropTarget?.folder == last.id)
+        for folder in ordered {
+            #expect((list.folderRow(folder.id) as? FolderRowView)?.isDropTarget == false, "\(folder.name)")
+        }
+
+        try await Task.sleep(for: .milliseconds(120))
+        for folder in ordered {
+            let row = try #require(list.folderRow(folder.id) as? FolderRowView)
+            #expect(row.isDropTarget == (folder.id == last.id), "\(folder.name)")
+            if folder.id != last.id { #expect(row.debugDropFlashes == 0, "\(folder.name) flashed") }
+        }
+        let lastRow = try #require(list.folderRow(last.id) as? FolderRowView)
+        #expect(lastRow.debugDropFlashes == 2)
+        #expect(!lastRow.debugDropAnimations.isEmpty)
+
+        // Leaving it for another folder clears it at once: no fill, no flash, still running.
+        let first = try #require(ordered.first)
+        _ = list.externalHover(at: screenPoint(NSPoint(x: first.frame.midX, y: first.frame.midY), in: window),
+                               allowsPinned: true, carrying: .bookmark(favorite.id))
+        #expect(!lastRow.isDropTarget)
+        #expect(lastRow.debugDropAnimations.isEmpty)
+
+        try await Task.sleep(for: .milliseconds(120))
+        let firstRow = try #require(list.folderRow(first.id) as? FolderRowView)
+        #expect(firstRow.isDropTarget)
+        #expect(firstRow.debugDropFlashes == 2)
+        try await Task.sleep(for: .milliseconds(900))
+        #expect(Library.shared.folder(first.id)?.isOpen == true)
     }
 
     /// Numbers show on favorites only: not on pinned cards, pinned rows or tabs.

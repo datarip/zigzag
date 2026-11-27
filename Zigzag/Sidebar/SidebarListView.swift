@@ -367,7 +367,13 @@ final class SidebarListView: NSView {
     /// The last pointer position in the list, for re-resolving after a folder opens under it.
     private var lastDragPoint: NSPoint?
     private var wasOverFavorites = false
-    private var lastFolderTarget: UUID?
+    /// How long a drag rests on a folder before its fill shows. The drop target is immediate for the landing; only
+    /// the fill waits, so a fast sweep crosses a column of folders without leaving a row lit behind it.
+    private static let folderTargetRest: TimeInterval = 0.07
+    /// The folder or group row lit now, and the one waiting out `folderTargetRest` to be lit.
+    private var shownFolderTarget: UUID?
+    private var pendingFolderTarget: UUID?
+    private var folderTargetWork: DispatchWorkItem?
     private var lastSplitTarget: SplitDrop?
     /// The drag move being handled, and the one that has already tapped: a move that changes several targets taps once.
     private var moveTick = 0
@@ -857,7 +863,7 @@ final class SidebarListView: NSView {
         configure(view, for: item)
         (view as? TabRowView)?.number = numbers[item]
         if let drag, carriedRowShown, drag.faint.contains(item) { view.alphaValue = CarriedCopy.faint }
-        if let drag, let id = Self.folderRowID(item) { (view as? FolderRowView)?.isDropTarget = drag.folderTarget == id }
+        if drag != nil, let id = Self.folderRowID(item) { (view as? FolderRowView)?.isDropTarget = shownFolderTarget == id }
         addSubview(view, positioned: .below, relativeTo: drag?.view)
         return view
     }
@@ -1045,12 +1051,36 @@ final class SidebarListView: NSView {
         SidebarDragTiming.tapped()
     }
 
-    /// Lights the folder or group row that takes the drop. A new target is the only news: the same one again changes
-    /// nothing, so the rows are left alone.
+    /// Takes the folder or group row that would take the drop. The drag's target is set at once for the landing, but
+    /// the fill waits here until the pointer has rested, so a fast sweep crosses rows without lighting them. A row
+    /// left behind goes dark at once; only the row that survives the rest eases in.
     private func showFolderTarget(_ id: UUID?) {
-        guard id != lastFolderTarget else { return }
-        if id != nil { tapForTarget() }
-        lastFolderTarget = id
+        guard id != pendingFolderTarget else { return }
+        folderTargetWork?.cancel()
+        folderTargetWork = nil
+        pendingFolderTarget = id
+        // Any wait belonged to the row the pointer has left.
+        cancelFolderSpring()
+        if id != shownFolderTarget { lightFolderTarget(nil) }
+        guard let id else { return }
+        tapForTarget()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.pendingFolderTarget == id else { return }
+                self.folderTargetWork = nil
+                self.lightFolderTarget(id)
+                self.restOnFolder(id)
+            }
+        }
+        folderTargetWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.folderTargetRest, execute: work)
+    }
+
+    /// Lights exactly one row. The fill eases in; a row that stops being the target is cleared at once by its own
+    /// `isDropTarget` change, with no fade to leave a trail.
+    private func lightFolderTarget(_ id: UUID?) {
+        guard id != shownFolderTarget else { return }
+        shownFolderTarget = id
         for (item, view) in rows {
             guard let row = view as? FolderRowView, let rowID = Self.folderRowID(item) else { continue }
             row.isDropTarget = rowID == id
@@ -1112,15 +1142,6 @@ final class SidebarListView: NSView {
         return nil
     }
 
-    /// A card from elsewhere over a shut folder's row uses the same rest and spring as a row.
-    private func noteExternalFolder(_ drop: SidebarDrop?) {
-        if let id = folderTarget(of: drop), Library.shared.folder(id)?.isOpen == false {
-            restOnFolder(id)
-        } else {
-            cancelFolderSpring()
-        }
-    }
-
     /// Pages Clear would close while it has hover or focus; their rows dim.
     private var clearPreview: Set<UUID>?
 
@@ -1158,6 +1179,13 @@ final class SidebarListView: NSView {
     }
     /// Clear is offered under the pointer, never while something is being dragged past it, nor again right after it.
     private var showsClear: Bool { isPointerInside && drag == nil }
+
+    /// Nothing in the list reacts to the pointer while a row is carried over it. Cleared on every move: a tracking
+    /// area can put hover back as rows shift under it, and a hover fill under the carried copy reads as a trail.
+    private func clearRowHover() {
+        for case let row as InteractiveView in rows.values where row.isHovered { row.isHovered = false }
+        (rows[.separator] as? SeparatorRowView)?.showsClear = false
+    }
 
     /// Hover follows where the pointer really is, once rows have moved under it during a drag.
     private func syncHover() {
@@ -1455,7 +1483,7 @@ final class SidebarListView: NSView {
         case .tabGroup(let id):
             guard let row = view as? FolderRowView, let group = manager.group(id) else { return }
             row.configure(name: group.name, open: group.isOpen, count: groupTabCounts[id] ?? 0, tabGroup: true)
-            row.isDropTarget = drag?.groupTarget == id
+            row.isDropTarget = drag != nil && shownFolderTarget == id
             row.setAccessibilityDisclosureLevel(0)
         case .bookmark(let id):
             guard let row = view as? TabRowView, let bookmark = Library.shared.bookmark(id) else { return }
@@ -2428,7 +2456,6 @@ final class SidebarListView: NSView {
         externalSnapshot = snapshot
         externalPinnedSnapshot = pinnedSnapshot
         placeLine()
-        noteExternalFolder(resolved)
         return resolved
     }
 
@@ -2533,9 +2560,7 @@ final class SidebarListView: NSView {
             }
             drag?.originFolder = start.drop?.folder ?? homeFolder
         }
-        // Nothing in the list reacts to the pointer while a row is carried over it.
-        for case let row as InteractiveView in rows.values { row.isHovered = false }
-        (rows[.separator] as? SeparatorRowView)?.showsClear = false
+        clearRowHover()
         for item in faint { rows[item]?.alphaValue = CarriedCopy.faint }
         copy.lift()
         // A finger held near the list's top or bottom scrolls it on.
@@ -2987,6 +3012,7 @@ final class SidebarListView: NSView {
 
     private func dragMoved(to event: NSEvent) {
         guard var drag, let window else { return }
+        clearRowHover()
         moveTick &+= 1
         #if DEBUG
         let moveStarted = CACurrentMediaTime(), moveStartedCPU = SidebarDragTiming.threadTime()
@@ -3101,8 +3127,7 @@ final class SidebarListView: NSView {
                 showFolderTarget(folderHit ?? groupHit)
             }
             // Resting on a shut folder opens it, so the pointer can then go in among its children and aim at a gap
-            // there. A move off the row puts the wait away.
-            restOnFolder(folderHit)
+            // there. The wait starts once the fill shows, in `showFolderTarget`.
             if folderHit == nil, groupHit == nil {
                 // On a row's middle: offer to open the two side by side, the line out of the way. On its edges: the
                 // line shows where it would go.

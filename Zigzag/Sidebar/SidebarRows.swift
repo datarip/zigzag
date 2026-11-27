@@ -1472,8 +1472,18 @@ final class FolderRowView: SidebarRowView, NSTextFieldDelegate {
     private let chevron = NSImageView()
     private let folderIcon = NSImageView()
     var isOpen = true { didSet { if oldValue != isOpen { showChevron(turning: true) } } }
-    /// While a pinned page or tab is dragged over it: it lights up to say it will take it.
-    var isDropTarget = false { didSet { stateDidChange(animated: true) } }
+    /// While a pinned page or tab is dragged over it: it lights up to say it will take it. The fill eases in; a row
+    /// left behind clears at once, with no fade, so a fast sweep leaves no trail.
+    var isDropTarget = false {
+        didSet {
+            guard oldValue != isDropTarget else { return }
+            if !isDropTarget {
+                layer?.removeAnimation(forKey: "flashDropTarget0")
+                layer?.removeAnimation(forKey: "flashDropTarget1")
+            }
+            stateDidChange(animated: isDropTarget)
+        }
+    }
     var onRename: ((String) -> Void)?
     private var renameField: PlainTextField?
 
@@ -1684,6 +1694,10 @@ final class FolderRowView: SidebarRowView, NSTextFieldDelegate {
     #if DEBUG
     /// How many times the row has flashed as a drop target, for a script or test.
     private(set) var debugDropFlashes = 0
+    /// The drop animations still running on the row, for a test: a row left behind keeps none.
+    var debugDropAnimations: [String] {
+        (layer?.animationKeys() ?? []).filter { $0 == "backgroundColor" || $0.hasPrefix("flashDropTarget") }
+    }
     #endif
 
     func beginRename() {
