@@ -84,8 +84,14 @@
   Test: SavePathTests.aFavoriteFiledInASpaceLeavesFavorites
 - A tab's menu in a group that can't be pinned whole (Settings is in it) → still offers Add to Favorites, as the menu bar and the command bar do.
   Test: SidebarRowMenuTests.aTabOfAnUnpinnableGroupStillAddsToFavorites
-- Move to Tabs on a favorite → it becomes a tab of the space you're in; Remove from Favorites → it's gone and its page closes.
+- Move to Tabs on a favorite → it becomes the first regular tab of the space you're in.
   No test yet.
+- Remove from Favorites → the page goes to the first regular tab. If it was pinned before, it goes back to its old pinned place, as a tile when tiles are on and as a row when they are off. One ⌘Z puts the favorite back.
+  No test yet.
+- Favorites and pinned tiles show at most three cards in a row. A fourth starts a new row.
+  Test: FavoriteColumnTests.aFourthCardStartsANewRow
+- A favorite card holds one page. A split favorited from tabs becomes one card per page, never one card with two pages.
+  Test: PinnedGroupTests.aFavoriteGroupOfFourIsFourCards
 
 ## Pinned tabs
 - ⌘W on a pinned tab → it unloads and stays pinned.
@@ -159,12 +165,23 @@
 ## Pinned tabs as tiles
 - Settings › Appearance › Pinned tabs as tiles, off by default → pinned pages are rows under the space's name.
   Test: AppearanceSwitchesTests.pinnedTabsAreRowsUntilTurnedOn
-- On → the pinned pages in no folder are tiles under the favorites, in the same grid, a fine line between the two; folders and their pages stay rows; ⌘1–⌘9 and ⌥⌘↓ count the tiles after the favorites. The choice is kept.
+- On → the pinned pages in no folder are tiles under the favorites, in the same grid, a fine line between the two; folders and their pages stay rows. The choice is kept.
   Test: AppearanceSwitchesTests.onPagesOutsideFoldersAreTilesUnderTheFavorites
+- The numbers on the Command key → the favorites only. Pinned tiles and pinned rows have no numbers.
+  Test: SidebarCardDragTests.numbersShowOnFavoritesOnly
 - A tile → a click opens it, × or a middle-click unloads it, and right-click has the pinned tab's menu.
   Test: AppearanceSwitchesTests.aTileOpensUnloadsAndHasThePinnedTabsMenu
 - Drag a tile among the tiles → it moves among the pinned pages, in one ⌘Z; out of the grid it goes into a folder, among the tabs, into Favorites, onto a space or another window, as its row would.
   Test: AppearanceSwitchesTests.draggingATileReordersThePinnedPages
+- A tile dropped at the top level of Pinned stays a tile. Dropped inside a folder or nested folder, at any gap, it becomes a pinned row at that gap.
+  Test: SidebarCardDragTests.aCardStaysACardAtTheRootAndBecomesARowInsideAFolder
+- A tile and a tab from another window land in this window's favorite grid or pinned-card grid at the line they show.
+  Test: SidebarCardDragTests.cardsAndTabsMoveIntoAnotherWindowsGrids
+- A favorite dropped above Old or below Docs → the line and the landing are the same gap.
+  Test: SidebarCardDragTests.aFavoriteOverOldDrawsAndLandsAtTheSameGap
+  Test: SidebarCardDragTests.aFavoriteBelowDocsDrawsAndLandsAboveB
+- A card resting on a shut folder → the folder flashes twice and opens after 0.8 seconds.
+  Test: SidebarCardDragTests.aCardOverAShutFolderFlashesTwiceThenOpensIt
 - A row dropped between tiles → pinned there, out of any folder; on a tile's middle, the two open side by side.
   Test: AppearanceSwitchesTests.aFoldersPageDroppedOnTheTilesIsPinnedThereOutOfItsFolder
 - A favorite dropped between tiles → pinned there; it leaves Favorites.
